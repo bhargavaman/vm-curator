@@ -32,3 +32,6 @@ result-*
 
 # AI stuff
 .claude/worktrees
+
+# direnv / nix-direnv cache
+.direnv/

@@ -215,7 +215,7 @@ The binary will be at `target/release/vm-curator`.
 - **Required**: QEMU (`qemu-system-*` binaries), qemu-img (for disk creation and snapshots), libudev
 - **Build**: a recent Rust stable toolchain (see `rust-toolchain.toml`), libudev-dev (Debian/Ubuntu) or systemd-libs (Arch/Fedora)
 - **Optional**:
-  - OVMF/edk2 — UEFI boot support (`edk2-ovmf` on Arch, `ovmf` on Debian/Ubuntu)
+  - OVMF/edk2 — UEFI boot support (`edk2-ovmf` on Arch, `ovmf` on Debian/Ubuntu); not needed where QEMU's bundled edk2 firmware is used (e.g. NixOS)
   - swtpm — TPM 2.0 emulation (required for Windows 11 VMs)
   - virt-viewer — SPICE-app display backend
   - passt — passt network backend
@@ -444,8 +444,10 @@ VM Curator automatically detects OVMF/UEFI firmware as matched CODE+VARS pairs (
 - Arch Linux: `/usr/share/edk2/x64/OVMF_CODE.4m.fd`
 - Debian/Ubuntu: `/usr/share/OVMF/OVMF_CODE_4M.fd`
 - Fedora/RHEL: `/usr/share/edk2/ovmf/OVMF_CODE_4M.qcow2`
-- NixOS: Multiple search paths supported
+- NixOS and any other host without an FHS OVMF package: the edk2 firmware QEMU bundles in its own data directory (`qemu-system-x86_64 -L help`) — no libvirt required
 - And more...
+
+To pin a specific firmware build, or on a host whose firmware lives somewhere unusual, set `VM_CURATOR_OVMF_DIR` to a directory containing a CODE+VARS pair (`OVMF_CODE*.fd`/`OVMF_VARS*.fd` or QEMU's `edk2-x86_64-code.fd`/`edk2-i386-vars.fd`). It is checked before every built-in path. On NixOS, for example: `VM_CURATOR_OVMF_DIR="${pkgs.OVMF.fd}/FV"`.
 
 ---
 
