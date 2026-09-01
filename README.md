@@ -358,7 +358,8 @@ VMs are expected in your library directory (default `~/vm-space/`) with this str
 ~/vm-space/
 ├── windows-95/
 │   ├── launch.sh      # QEMU launch script (required)
-│   └── disk.qcow2     # Disk image (qcow2 recommended for snapshots)
+│   ├── disk.qcow2     # Disk image (qcow2 recommended for snapshots)
+│   └── qemu.log       # Output of the last launch (command + stdout/stderr); qemu.log.old = the one before
 ├── linux-debian/
 │   ├── launch.sh
 │   ├── disk.qcow2

@@ -1,10 +1,9 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
-use std::io::{BufRead, BufReader};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
@@ -148,6 +147,107 @@ fn check_bridge_exists(vm: &DiscoveredVm) -> Result<(), String> {
     }
 }
 
+/// Per-VM log of the last launch: the exact command, then everything
+/// `launch.sh` and QEMU wrote to stdout/stderr, streamed live.
+///
+/// QEMU's stderr used to be captured only in memory and shown only if the
+/// process died within the first second — warnings from a VM that *ran* (GL,
+/// virgl, audio, USB) were unrecoverable. The log lives next to the VM so it
+/// is trivial to find and to attach to a bug report.
+pub const QEMU_LOG_FILE: &str = "qemu.log";
+/// The previous launch's log, kept for comparison.
+pub const QEMU_LOG_PREVIOUS: &str = "qemu.log.old";
+
+/// Path of the VM's launch log.
+pub fn qemu_log_path(vm_path: &Path) -> PathBuf {
+    vm_path.join(QEMU_LOG_FILE)
+}
+
+/// An open launch log: the file both child streams are pointed at, plus
+/// where it lives (the VM directory, or a temp-dir fallback if that failed).
+struct QemuLog {
+    file: std::fs::File,
+    path: PathBuf,
+}
+
+/// Rotate the previous log aside and open a fresh one with a launch header.
+///
+/// The child's stdout and stderr are redirected straight into this file, so
+/// logging does not depend on the launcher staying alive: `vm-curator launch`
+/// returns within a second while QEMU keeps writing for hours. If the VM
+/// directory is not writable the log falls back to the system temp dir.
+fn open_qemu_log(vm_path: &Path, invocation: &LaunchInvocation) -> std::io::Result<QemuLog> {
+    let path = qemu_log_path(vm_path);
+    let (mut file, path) = match rotate_and_create(&path, &vm_path.join(QEMU_LOG_PREVIOUS)) {
+        Ok(file) => (file, path),
+        Err(e) => {
+            log::warn!(
+                "could not open {}: {e}; logging to temp dir",
+                path.display()
+            );
+            let name = vm_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "vm".to_string());
+            let fallback = std::env::temp_dir().join(format!("vm-curator-{name}.log"));
+            let file = rotate_and_create(&fallback, &fallback.with_extension("log.old"))?;
+            (file, fallback)
+        }
+    };
+    writeln!(
+        file,
+        "# vm-curator launch {}",
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z")
+    )?;
+    writeln!(
+        file,
+        "# command: {} {}",
+        invocation.program,
+        invocation.args.join(" ")
+    )?;
+    for (name, value) in &invocation.env {
+        if let Some(value) = value {
+            writeln!(file, "# env: {name}={value}")?;
+        }
+    }
+    writeln!(file, "# --- stdout/stderr of launch.sh and QEMU ---")?;
+    file.flush()?;
+    Ok(QemuLog { file, path })
+}
+
+fn rotate_and_create(path: &Path, previous: &Path) -> std::io::Result<std::fs::File> {
+    if path.exists() {
+        let _ = std::fs::rename(path, previous);
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+}
+
+/// Point the child's stdout and stderr at the log (both handles share one
+/// append-mode file description, so lines interleave in write order).
+fn redirect_output_to_log(cmd: &mut Command, log: &QemuLog) {
+    match (log.file.try_clone(), log.file.try_clone()) {
+        (Ok(out), Ok(err)) => {
+            cmd.stdout(Stdio::from(out)).stderr(Stdio::from(err));
+        }
+        _ => {
+            cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        }
+    }
+}
+
+/// The process output recorded in the log so far (header lines excluded).
+fn logged_output_lines(log: &QemuLog) -> Vec<String> {
+    std::fs::read_to_string(&log.path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.starts_with("# ") && !l.trim().is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LaunchInvocation {
     program: String,
@@ -289,12 +389,23 @@ pub fn launch_vm_with_error_check(vm: &DiscoveredVm, options: &LaunchOptions) ->
         }
     }
 
-    let mut cmd = invocation.command();
+    // Per-VM log: both child streams go straight to the file, so the log is
+    // complete no matter how soon this launcher returns.
+    let log = match open_qemu_log(&vm.path, &invocation) {
+        Ok(log) => log,
+        Err(e) => {
+            return LaunchResult {
+                success: false,
+                error: Some(format!("Failed to open launch log: {e}")),
+                vm_name,
+            };
+        }
+    };
+    let log_hint = format!("\nFull log: {}", log.path.display());
 
-    // Capture stderr to detect errors, but let stdout go to null
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
+    let mut cmd = invocation.command();
+    cmd.stdin(Stdio::null());
+    redirect_output_to_log(&mut cmd, &log);
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -307,36 +418,6 @@ pub fn launch_vm_with_error_check(vm: &DiscoveredVm, options: &LaunchOptions) ->
         }
     };
 
-    // Take stderr handle for monitoring
-    let stderr = match child.stderr.take() {
-        Some(s) => s,
-        None => {
-            return LaunchResult {
-                success: true,
-                error: None,
-                vm_name,
-            };
-        }
-    };
-
-    // Create a channel to receive error output
-    let (tx, rx) = mpsc::channel();
-
-    // Spawn a thread to read ALL stderr output
-    thread::spawn(move || {
-        let reader = BufReader::new(stderr);
-        let mut all_lines = Vec::new();
-
-        for line in reader.lines().map_while(Result::ok) {
-            // Capture all stderr output - we'll filter later if needed
-            if !line.trim().is_empty() {
-                all_lines.push(line);
-            }
-        }
-
-        let _ = tx.send(all_lines);
-    });
-
     // Wait for QEMU to either start successfully or fail
     // QEMU typically fails fast if there's a configuration error
     thread::sleep(Duration::from_millis(800));
@@ -347,13 +428,8 @@ pub fn launch_vm_with_error_check(vm: &DiscoveredVm, options: &LaunchOptions) ->
             // Process exited - this usually means an error for QEMU
             // (successful QEMU keeps running until the VM shuts down)
 
-            // Wait a bit more for stderr to be fully captured
-            thread::sleep(Duration::from_millis(300));
-
-            // Try to get error output
-            let stderr_lines = rx
-                .recv_timeout(Duration::from_millis(500))
-                .unwrap_or_default();
+            // Everything the process wrote is already in the log file.
+            let stderr_lines = logged_output_lines(&log);
 
             // Filter for error-related lines for display
             let error_lines: Vec<&String> = stderr_lines
@@ -389,7 +465,7 @@ pub fn launch_vm_with_error_check(vm: &DiscoveredVm, options: &LaunchOptions) ->
 
             return LaunchResult {
                 success: false,
-                error: Some(error_msg),
+                error: Some(format!("{error_msg}{log_hint}")),
                 vm_name,
             };
         }
@@ -451,29 +527,30 @@ pub fn launch_vm_dbus(vm: &DiscoveredVm) -> Result<u32> {
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755));
 
-    let mut child = Command::new("bash")
-        .arg(&tmp)
-        .current_dir(&vm.path)
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context("Failed to spawn QEMU")?;
+    let invocation = LaunchInvocation {
+        program: "bash".to_string(),
+        current_dir: vm.path.clone(),
+        args: vec![tmp.to_string_lossy().to_string()],
+        env: Vec::new(),
+    };
+    let log = open_qemu_log(&vm.path, &invocation).context("Failed to open launch log")?;
+
+    let mut cmd = invocation.command();
+    redirect_output_to_log(&mut cmd, &log);
+    let mut child = cmd.spawn().context("Failed to spawn QEMU")?;
     let pid = child.id();
 
     // Brief poll to catch immediate QEMU startup failures (missing session D-Bus,
     // bad flag, missing library) before returning Ok(pid) to the caller.
     thread::sleep(Duration::from_millis(300));
     if let Ok(Some(status)) = child.try_wait() {
-        use std::io::Read;
-        let stderr = child
-            .stderr
-            .take()
-            .map(|mut s| {
-                let mut b = String::new();
-                s.read_to_string(&mut b).ok();
-                b
-            })
-            .unwrap_or_default();
-        bail!("QEMU exited immediately ({}): {}", status, stderr.trim());
+        let output = logged_output_lines(&log).join("\n");
+        bail!(
+            "QEMU exited immediately ({}): {}\nFull log: {}",
+            status,
+            output.trim(),
+            log.path.display()
+        );
     }
     // child intentionally dropped — QEMU process continues running
 

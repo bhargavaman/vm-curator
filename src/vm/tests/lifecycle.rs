@@ -1041,3 +1041,142 @@ fn test_ensure_ovmf_vars_writable_is_noop_without_vars_file() {
     ensure_ovmf_vars_writable(tmp.path()).unwrap();
     assert!(ensure_ovmf_vars_writable(Path::new("/nonexistent/vm-curator-vm")).is_ok());
 }
+
+// ---------------------------------------------------------------------------
+// Per-VM launch log (qemu.log)
+// ---------------------------------------------------------------------------
+
+fn write_stub_launch_script(dir: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("launch.sh");
+    std::fs::write(&path, format!("#!/usr/bin/env bash\n{body}\n")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn launch_options(boot_mode: BootMode) -> LaunchOptions {
+    LaunchOptions {
+        boot_mode,
+        extra_args: Vec::new(),
+        usb_devices: Vec::new(),
+        window_size: None,
+    }
+}
+
+/// Poll the log until it contains `needle` (the stderr tee is asynchronous).
+fn wait_for_log(path: &Path, needle: &str) -> String {
+    for _ in 0..60 {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            if content.contains(needle) {
+                return content;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!(
+        "{needle:?} never appeared in {}:\n{}",
+        path.display(),
+        std::fs::read_to_string(path).unwrap_or_default()
+    );
+}
+
+#[test]
+fn launch_writes_per_vm_log_with_header_and_both_streams() {
+    let dir = tempfile::tempdir().unwrap();
+    // Keep running past the 800ms startup check so this counts as a success.
+    write_stub_launch_script(
+        dir.path(),
+        "echo 'Booting stub...'\necho 'qemu-system-x86_64: warning: virgl fake warning' >&2\nsleep 2",
+    );
+    let vm = test_vm(dir.path());
+
+    let result = launch_vm_with_error_check(&vm, &launch_options(BootMode::Install));
+    assert!(result.success, "{:?}", result.error);
+
+    let log = qemu_log_path(dir.path());
+    let content = wait_for_log(&log, "virgl fake warning");
+    assert!(content.starts_with("# vm-curator launch "), "{content}");
+    assert!(
+        content.contains(&format!(
+            "# command: bash {} --install",
+            dir.path().join("launch.sh").display()
+        )),
+        "{content}"
+    );
+    assert!(
+        content.contains("Booting stub..."),
+        "stdout missing: {content}"
+    );
+    assert!(
+        content.contains("qemu-system-x86_64: warning: virgl fake warning"),
+        "stderr missing: {content}"
+    );
+    // A VM that ran fine still has its warnings on disk — the whole point.
+    assert!(!content.contains("Full log:"));
+}
+
+#[test]
+fn launch_failure_reports_error_and_points_at_log() {
+    let dir = tempfile::tempdir().unwrap();
+    write_stub_launch_script(
+        dir.path(),
+        "echo \"qemu-system-x86_64: Could not open '/x/OVMF_VARS.fd': Permission denied\" >&2\nexit 1",
+    );
+    let vm = test_vm(dir.path());
+
+    let result = launch_vm_with_error_check(&vm, &launch_options(BootMode::Normal));
+    assert!(!result.success);
+    let error = result.error.unwrap();
+    assert!(error.contains("Permission denied"), "{error}");
+    assert!(
+        error.contains(&format!(
+            "Full log: {}",
+            qemu_log_path(dir.path()).display()
+        )),
+        "{error}"
+    );
+
+    let content = wait_for_log(&qemu_log_path(dir.path()), "Permission denied");
+    assert!(content.contains("Permission denied"));
+}
+
+#[test]
+fn launch_log_keeps_capturing_after_launcher_returns() {
+    // `vm-curator launch` (CLI) returns within a second while QEMU runs on.
+    // Output written after that must still land in the log — this is the
+    // difference between redirecting the child's fds and piping through us.
+    let dir = tempfile::tempdir().unwrap();
+    write_stub_launch_script(
+        dir.path(),
+        "echo EARLY >&2\nsleep 1.5\necho 'LATE: after launcher returned' >&2",
+    );
+    let vm = test_vm(dir.path());
+
+    let result = launch_vm_with_error_check(&vm, &launch_options(BootMode::Normal));
+    assert!(result.success, "{:?}", result.error);
+    let early = std::fs::read_to_string(qemu_log_path(dir.path())).unwrap();
+    assert!(
+        early.contains("EARLY") && !early.contains("LATE"),
+        "{early}"
+    );
+
+    let content = wait_for_log(&qemu_log_path(dir.path()), "LATE: after launcher returned");
+    assert!(content.contains("EARLY"));
+}
+
+#[test]
+fn launch_rotates_previous_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let vm = test_vm(dir.path());
+
+    write_stub_launch_script(dir.path(), "echo FIRST-RUN >&2\nexit 1");
+    launch_vm_with_error_check(&vm, &launch_options(BootMode::Normal));
+    wait_for_log(&qemu_log_path(dir.path()), "FIRST-RUN");
+
+    write_stub_launch_script(dir.path(), "echo SECOND-RUN >&2\nexit 1");
+    launch_vm_with_error_check(&vm, &launch_options(BootMode::Normal));
+    let current = wait_for_log(&qemu_log_path(dir.path()), "SECOND-RUN");
+    let previous = std::fs::read_to_string(dir.path().join(QEMU_LOG_PREVIOUS)).unwrap();
+
+    assert!(current.contains("SECOND-RUN") && !current.contains("FIRST-RUN"));
+    assert!(previous.contains("FIRST-RUN") && !previous.contains("SECOND-RUN"));
+}
