@@ -58,7 +58,8 @@ fn test_generate_launch_script() {
         None,
     );
 
-    assert!(script.contains("#!/bin/bash"));
+    // NixOS has no /bin/bash; the script must be directly executable there too.
+    assert!(script.starts_with("#!/usr/bin/env bash\n"));
     assert!(script.contains("Test VM"));
     assert!(script.contains("test.qcow2"));
     assert!(script.contains("/tmp/test.iso"));
@@ -1440,6 +1441,25 @@ fn test_default_ovmf_firmware_is_raw() {
     assert_eq!(fw.format, "raw");
     assert!(fw.code.ends_with(".fd"));
     assert!(fw.vars_template.ends_with(".fd"));
+}
+
+#[test]
+fn test_ovmf_vars_setup_makes_copy_writable() {
+    // `cp` preserves the template's mode; a template on a read-only store
+    // (NixOS /nix/store, 0444) would otherwise yield a copy QEMU can't open
+    // read-write. The block must self-heal existing copies too, not only
+    // freshly created ones.
+    for secboot in [false, true] {
+        let setup = generate_ovmf_vars_setup(secboot);
+        assert!(setup.contains(r#"if [[ -f "$OVMF_VARS" && ! -w "$OVMF_VARS" ]]; then"#));
+        assert!(setup.contains(r#"    chmod u+w "$OVMF_VARS""#));
+        // The chmod must come after the copy so it applies to a fresh copy.
+        let cp = setup
+            .find(r#"cp "$OVMF_VARS_TEMPLATE" "$OVMF_VARS""#)
+            .unwrap();
+        let chmod = setup.find(r#"chmod u+w "$OVMF_VARS""#).unwrap();
+        assert!(cp < chmod);
+    }
 }
 
 #[test]

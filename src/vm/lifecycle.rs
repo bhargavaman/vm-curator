@@ -266,6 +266,9 @@ pub fn launch_vm_with_error_check(vm: &DiscoveredVm, options: &LaunchOptions) ->
     if let Err(e) = ensure_qmp_in_script(&vm.path) {
         log::warn!("launch_vm_with_error_check: could not patch QMP into launch.sh: {e}");
     }
+    if let Err(e) = ensure_ovmf_vars_writable(&vm.path) {
+        log::warn!("launch_vm_with_error_check: could not make OVMF_VARS writable: {e}");
+    }
 
     let invocation = match build_launch_invocation(vm, options) {
         Ok(invocation) => invocation,
@@ -434,6 +437,9 @@ pub fn launch_vm_dbus(vm: &DiscoveredVm) -> Result<u32> {
 
     if let Err(e) = ensure_qmp_in_script(&vm.path) {
         log::warn!("launch_vm_dbus: could not patch QMP into launch.sh: {e}");
+    }
+    if let Err(e) = ensure_ovmf_vars_writable(&vm.path) {
+        log::warn!("launch_vm_dbus: could not make OVMF_VARS writable: {e}");
     }
 
     let script_path = vm.path.join("launch.sh");
@@ -1986,6 +1992,34 @@ const QMP_ARG: &str = "        -qmp unix:\"$VM_DIR/qemu.sock\",server=on,wait=of
 /// Patch an existing launch.sh to include a QMP socket if not already present.
 /// Idempotent — safe to call before every launch.
 #[allow(dead_code)]
+/// Make the VM's per-VM `OVMF_VARS` copy writable if it is not.
+///
+/// `launch.sh` creates that copy with `cp`, which preserves the template's
+/// mode. When the template lives on a read-only store — NixOS's `/nix/store`
+/// is mode 0444 — the copy is read-only too and QEMU aborts with
+/// `Could not open '.../OVMF_VARS.fd': Permission denied`. Scripts generated
+/// after this fix repair the copy themselves; this repairs VMs created before
+/// it. A missing file (BIOS VM, or first launch) is not an error.
+pub fn ensure_ovmf_vars_writable(vm_path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    for name in ["OVMF_VARS.fd", "OVMF_VARS.qcow2"] {
+        let path = vm_path.join(name);
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let mut perms = meta.permissions();
+        if perms.mode() & 0o200 == 0 {
+            perms.set_mode(perms.mode() | 0o200);
+            std::fs::set_permissions(&path, perms)
+                .with_context(|| format!("Failed to make {} writable", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
 pub fn ensure_qmp_in_script(vm_path: &Path) -> Result<()> {
     let script_path = vm_path.join("launch.sh");
     let content =

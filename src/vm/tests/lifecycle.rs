@@ -978,3 +978,66 @@ fn test_disk_passthrough_coexists_with_usb_section() {
     assert_eq!(disks.len(), 1);
     assert_eq!(disks[0].bootindex, Some(2));
 }
+
+// ---------------------------------------------------------------------------
+// OVMF_VARS writability repair (NixOS read-only firmware templates)
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+fn mode_of(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+#[cfg(unix)]
+fn write_with_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, b"vars").unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn test_ensure_ovmf_vars_writable_adds_owner_write_bit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let vars = tmp.path().join("OVMF_VARS.fd");
+    // Exactly what `cp` from /nix/store produces.
+    write_with_mode(&vars, 0o444);
+
+    ensure_ovmf_vars_writable(tmp.path()).unwrap();
+
+    assert_eq!(mode_of(&vars), 0o644);
+}
+
+#[test]
+#[cfg(unix)]
+fn test_ensure_ovmf_vars_writable_handles_qcow2_variant() {
+    let tmp = tempfile::tempdir().unwrap();
+    let vars = tmp.path().join("OVMF_VARS.qcow2");
+    write_with_mode(&vars, 0o444);
+
+    ensure_ovmf_vars_writable(tmp.path()).unwrap();
+
+    assert_eq!(mode_of(&vars), 0o644);
+}
+
+#[test]
+#[cfg(unix)]
+fn test_ensure_ovmf_vars_writable_leaves_writable_file_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let vars = tmp.path().join("OVMF_VARS.fd");
+    write_with_mode(&vars, 0o600);
+
+    ensure_ovmf_vars_writable(tmp.path()).unwrap();
+
+    // Only the owner-write bit is ever added; other bits are never touched.
+    assert_eq!(mode_of(&vars), 0o600);
+}
+
+#[test]
+fn test_ensure_ovmf_vars_writable_is_noop_without_vars_file() {
+    // BIOS VMs and first launches have no OVMF_VARS yet: not an error.
+    let tmp = tempfile::tempdir().unwrap();
+    ensure_ovmf_vars_writable(tmp.path()).unwrap();
+    assert!(ensure_ovmf_vars_writable(Path::new("/nonexistent/vm-curator-vm")).is_ok());
+}

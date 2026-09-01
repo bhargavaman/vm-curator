@@ -863,6 +863,12 @@ if [[ ! -f "$OVMF_VARS" ]]; then
     fi
 fi
 
+# cp keeps the template's mode. On a read-only store (NixOS /nix/store) that
+# leaves the copy read-only and QEMU cannot open it as writable pflash.
+if [[ -f "$OVMF_VARS" && ! -w "$OVMF_VARS" ]]; then
+    chmod u+w "$OVMF_VARS"
+fi
+
 "#,
         template = firmware.vars_template,
         ext = vars_ext
@@ -964,7 +970,8 @@ pub fn generate_launch_script_with_os<'a>(
     let needs_uefi = config.uefi || is_windows_11(os_profile);
 
     // Shebang and header
-    script.push_str("#!/bin/bash\n\n");
+    // `env bash`: NixOS has no /bin/bash, and bash is on PATH everywhere else.
+    script.push_str("#!/usr/bin/env bash\n\n");
     script.push_str(&format!("# {} VM Launch Script\n", vm_name));
     script.push_str(&format!(
         "# {} CPUs, {}MB RAM, {} graphics, {} disk interface\n",
