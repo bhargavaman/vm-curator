@@ -58,7 +58,8 @@ fn test_generate_launch_script() {
         None,
     );
 
-    assert!(script.contains("#!/bin/bash"));
+    // NixOS has no /bin/bash; the script must be directly executable there too.
+    assert!(script.starts_with("#!/usr/bin/env bash\n"));
     assert!(script.contains("Test VM"));
     assert!(script.contains("test.qcow2"));
     assert!(script.contains("/tmp/test.iso"));
@@ -1440,6 +1441,162 @@ fn test_default_ovmf_firmware_is_raw() {
     assert_eq!(fw.format, "raw");
     assert!(fw.code.ends_with(".fd"));
     assert!(fw.vars_template.ends_with(".fd"));
+}
+
+#[test]
+fn test_ovmf_vars_setup_makes_copy_writable() {
+    // `cp` preserves the template's mode; a template on a read-only store
+    // (NixOS /nix/store, 0444) would otherwise yield a copy QEMU can't open
+    // read-write. The block must self-heal existing copies too, not only
+    // freshly created ones.
+    for secboot in [false, true] {
+        let setup = generate_ovmf_vars_setup(secboot);
+        assert!(setup.contains(r#"if [[ -f "$OVMF_VARS" && ! -w "$OVMF_VARS" ]]; then"#));
+        assert!(setup.contains(r#"    chmod u+w "$OVMF_VARS""#));
+        // The chmod must come after the copy so it applies to a fresh copy.
+        let cp = setup
+            .find(r#"cp "$OVMF_VARS_TEMPLATE" "$OVMF_VARS""#)
+            .unwrap();
+        let chmod = setup.find(r#"chmod u+w "$OVMF_VARS""#).unwrap();
+        assert!(cp < chmod);
+    }
+}
+
+#[test]
+fn test_ovmf_dir_pair_tables_are_format_consistent() {
+    assert_pairs_consistent(OVMF_DIR_PAIRS);
+    assert_pairs_consistent(OVMF_DIR_SECBOOT_PAIRS);
+}
+
+/// Create empty stand-in firmware files in `dir`.
+fn touch_all(dir: &Path, names: &[&str]) {
+    for name in names {
+        std::fs::write(dir.join(name), b"").unwrap();
+    }
+}
+
+#[test]
+fn test_find_ovmf_in_dir_finds_qemu_bundled_edk2_pair() {
+    // What `qemu-system-x86_64 -L help` points at on a libvirt-free NixOS
+    // host: QEMU's own edk2 images, no OVMF_* names at all.
+    let dir = tempfile::tempdir().unwrap();
+    touch_all(
+        dir.path(),
+        &[
+            "edk2-x86_64-code.fd",
+            "edk2-x86_64-secure-code.fd",
+            "edk2-i386-vars.fd",
+        ],
+    );
+
+    let fw = find_ovmf_in_dir(dir.path(), false).expect("edk2 pair");
+    assert!(fw.code.ends_with("/edk2-x86_64-code.fd"));
+    assert!(fw.vars_template.ends_with("/edk2-i386-vars.fd"));
+    assert_eq!(fw.format, "raw");
+
+    let secure = find_ovmf_in_dir(dir.path(), true).expect("edk2 secure pair");
+    assert!(secure.code.ends_with("/edk2-x86_64-secure-code.fd"));
+    assert!(secure.vars_template.ends_with("/edk2-i386-vars.fd"));
+}
+
+#[test]
+fn test_find_ovmf_in_dir_prefers_ovmf_names_over_edk2_names() {
+    let dir = tempfile::tempdir().unwrap();
+    touch_all(
+        dir.path(),
+        &[
+            "OVMF_CODE.fd",
+            "OVMF_VARS.fd",
+            "edk2-x86_64-code.fd",
+            "edk2-i386-vars.fd",
+        ],
+    );
+    let fw = find_ovmf_in_dir(dir.path(), false).unwrap();
+    assert!(fw.code.ends_with("/OVMF_CODE.fd"));
+    assert!(fw.vars_template.ends_with("/OVMF_VARS.fd"));
+}
+
+#[test]
+fn test_find_ovmf_in_dir_requires_both_halves() {
+    // CODE without its VARS template must not be selected: a mismatched or
+    // missing VARS is exactly the failure mode pair selection exists to avoid.
+    let dir = tempfile::tempdir().unwrap();
+    touch_all(dir.path(), &["OVMF_CODE.fd", "edk2-x86_64-code.fd"]);
+    assert!(find_ovmf_in_dir(dir.path(), false).is_none());
+    assert!(find_ovmf_in_dir(dir.path(), true).is_none());
+    assert!(find_ovmf_in_dir(Path::new("/nonexistent/vm-curator-ovmf"), false).is_none());
+}
+
+#[test]
+fn test_select_ovmf_override_dir_wins_and_skips_qemu_probe() {
+    let dir = tempfile::tempdir().unwrap();
+    touch_all(dir.path(), &["OVMF_CODE.fd", "OVMF_VARS.fd"]);
+
+    let fw = select_ovmf_firmware(Some(dir.path()), false, || {
+        panic!("QEMU data dirs must not be probed when the override matches")
+    })
+    .unwrap();
+    assert_eq!(fw.code, dir.path().join("OVMF_CODE.fd").to_string_lossy());
+    assert_eq!(
+        fw.vars_template,
+        dir.path().join("OVMF_VARS.fd").to_string_lossy()
+    );
+}
+
+#[test]
+fn test_select_ovmf_falls_back_to_qemu_dirs_when_override_is_empty() {
+    // An override directory with nothing usable must not block detection.
+    let empty = tempfile::tempdir().unwrap();
+    let qemu_dir = tempfile::tempdir().unwrap();
+    touch_all(
+        qemu_dir.path(),
+        &["edk2-x86_64-code.fd", "edk2-i386-vars.fd"],
+    );
+
+    let qemu_path = qemu_dir.path().to_path_buf();
+    let fw = select_ovmf_firmware(Some(empty.path()), false, move || vec![qemu_path]);
+
+    // On a host with distro OVMF installed the well-known tables win first;
+    // that is correct behaviour, so only pin the QEMU-dir result otherwise.
+    if first_existing_pair(OVMF_PAIRS).is_none() {
+        let fw = fw.expect("QEMU data dir pair");
+        assert!(fw
+            .code
+            .starts_with(&qemu_dir.path().to_string_lossy().to_string()));
+        assert!(fw.code.ends_with("/edk2-x86_64-code.fd"));
+    } else {
+        assert!(fw.is_some());
+    }
+}
+
+#[test]
+fn test_select_ovmf_returns_none_when_nothing_found() {
+    if first_existing_pair(OVMF_PAIRS).is_some() {
+        // Distro firmware present on this host; the "nothing" case can't be
+        // constructed without touching the filesystem outside a tempdir.
+        return;
+    }
+    assert!(select_ovmf_firmware(None, false, Vec::new).is_none());
+    assert!(select_ovmf_firmware(None, true, Vec::new).is_none());
+}
+
+/// Exercises the real `-L help` probe when QEMU is installed on the host
+/// (a no-op on hosts without QEMU, e.g. CI).
+#[test]
+fn test_qemu_data_dirs_are_existing_directories() {
+    let dirs = qemu_data_dirs();
+    assert!(dirs.iter().all(|d| d.is_dir()), "{dirs:?}");
+    if dirs
+        .iter()
+        .any(|d| d.join("edk2-x86_64-code.fd").is_file() && d.join("edk2-i386-vars.fd").is_file())
+    {
+        let fw = dirs
+            .iter()
+            .find_map(|d| find_ovmf_in_dir(d, false))
+            .expect("QEMU ships an edk2 pair here");
+        assert!(Path::new(&fw.code).is_file());
+        assert!(Path::new(&fw.vars_template).is_file());
+    }
 }
 
 #[test]

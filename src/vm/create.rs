@@ -240,7 +240,10 @@ const OVMF_PAIRS: &[(&str, &str, &str)] = &[
         "/usr/share/edk2/x64/OVMF_VARS.fd",
         "raw",
     ),
-    // NixOS
+    // NixOS with `virtualisation.libvirtd` enabled (older nixpkgs populated
+    // this directory with OVMF_* names). A libvirt-free NixOS host has no
+    // stable FHS firmware path at all; it is served by the QEMU data-dir
+    // probe in `find_ovmf_firmware` instead.
     (
         "/run/libvirt/nix-ovmf/OVMF_CODE.fd",
         "/run/libvirt/nix-ovmf/OVMF_VARS.fd",
@@ -268,26 +271,154 @@ fn default_ovmf_firmware() -> OvmfFirmware {
     }
 }
 
+/// Environment variable naming a directory that holds a CODE+VARS firmware
+/// pair; when set it takes precedence over every built-in search path.
+///
+/// Intended for hosts whose firmware lives somewhere non-FHS (NixOS:
+/// `${pkgs.OVMF.fd}/FV`) or for deliberately pinning a specific build. The
+/// directory is scanned for the filename pairs in [`OVMF_DIR_PAIRS`] /
+/// [`OVMF_DIR_SECBOOT_PAIRS`].
+pub const OVMF_DIR_ENV: &str = "VM_CURATOR_OVMF_DIR";
+
+/// Filename pairs `(code, vars, format)` searched, in priority order, inside a
+/// single directory — the `VM_CURATOR_OVMF_DIR` override or one of QEMU's own
+/// data directories.
+///
+/// Distro OVMF names come first (4M before 2M, mirroring [`OVMF_PAIRS`]); the
+/// `edk2-*` names are the firmware images QEMU bundles upstream and ships in its
+/// data directory on every platform (`qemu-system-x86_64 -L help`). QEMU's own
+/// firmware descriptor pairs `edk2-x86_64-code.fd` with `edk2-i386-vars.fd`.
+const OVMF_DIR_PAIRS: &[(&str, &str, &str)] = &[
+    ("OVMF_CODE_4M.qcow2", "OVMF_VARS_4M.qcow2", "qcow2"),
+    ("OVMF_CODE_4M.fd", "OVMF_VARS_4M.fd", "raw"),
+    ("OVMF_CODE.4m.fd", "OVMF_VARS.4m.fd", "raw"),
+    ("OVMF_CODE.fd", "OVMF_VARS.fd", "raw"),
+    ("edk2-x86_64-code.fd", "edk2-i386-vars.fd", "raw"),
+];
+
+/// Secure Boot counterpart of [`OVMF_DIR_PAIRS`].
+const OVMF_DIR_SECBOOT_PAIRS: &[(&str, &str, &str)] = &[
+    (
+        "OVMF_CODE_4M.secboot.qcow2",
+        "OVMF_VARS_4M.secboot.qcow2",
+        "qcow2",
+    ),
+    ("OVMF_CODE_4M.secboot.fd", "OVMF_VARS_4M.ms.fd", "raw"),
+    ("OVMF_CODE_4M.ms.fd", "OVMF_VARS_4M.ms.fd", "raw"),
+    ("OVMF_CODE.secboot.4m.fd", "OVMF_VARS.4m.fd", "raw"),
+    ("OVMF_CODE.secboot.fd", "OVMF_VARS.ms.fd", "raw"),
+    ("OVMF_CODE.secboot.fd", "OVMF_VARS.fd", "raw"),
+    ("edk2-x86_64-secure-code.fd", "edk2-i386-vars.fd", "raw"),
+];
+
+/// Return the first pair from `table` whose CODE and VARS both exist on disk.
+fn first_existing_pair(table: &[(&str, &str, &'static str)]) -> Option<OvmfFirmware> {
+    table
+        .iter()
+        .find(|(code, vars, _)| Path::new(code).exists() && Path::new(vars).exists())
+        .map(|&(code, vars, format)| OvmfFirmware {
+            code: code.to_string(),
+            vars_template: vars.to_string(),
+            format,
+        })
+}
+
+/// Scan a single directory for a matched firmware pair by filename.
+fn find_ovmf_in_dir(dir: &Path, secboot: bool) -> Option<OvmfFirmware> {
+    let table: &[(&str, &str, &'static str)] = if secboot {
+        OVMF_DIR_SECBOOT_PAIRS
+    } else {
+        OVMF_DIR_PAIRS
+    };
+    table
+        .iter()
+        .map(|&(code, vars, format)| (dir.join(code), dir.join(vars), format))
+        .find(|(code, vars, _)| code.is_file() && vars.is_file())
+        .map(|(code, vars, format)| OvmfFirmware {
+            code: code.to_string_lossy().into_owned(),
+            vars_template: vars.to_string_lossy().into_owned(),
+            format,
+        })
+}
+
+/// Data directories reported by QEMU itself (`qemu-system-x86_64 -L help`).
+///
+/// QEMU bundles edk2 firmware in its data directory on every platform, so this
+/// finds UEFI firmware anywhere QEMU is installed — including hosts with no FHS
+/// OVMF package at all (NixOS without libvirt, custom prefixes). Only existing
+/// directories are returned; a missing emulator yields an empty list.
+fn qemu_data_dirs() -> Vec<PathBuf> {
+    for emulator in ["qemu-system-x86_64", "qemu-system-i386"] {
+        let Ok(output) = std::process::Command::new(emulator)
+            .args(["-L", "help"])
+            .output()
+        else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let dirs: Vec<PathBuf> = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(PathBuf::from)
+            .filter(|dir| dir.is_dir())
+            // QEMU reports `<prefix>/bin/../share/qemu`; resolve the `..` so the
+            // generated launch.sh carries a clean path.
+            .map(|dir| dir.canonicalize().unwrap_or(dir))
+            .collect();
+        if !dirs.is_empty() {
+            return dirs;
+        }
+    }
+    Vec::new()
+}
+
 /// Select a matched OVMF CODE+VARS firmware pair, preferring 4M builds.
 ///
 /// Both the CODE and VARS file of a candidate pair must exist on disk before it
 /// is chosen, so the returned CODE and VARS always agree in size and format.
+///
+/// Search order:
+/// 1. the directory named by `VM_CURATOR_OVMF_DIR`, if set;
+/// 2. the well-known distro paths in [`OVMF_PAIRS`] / [`OVMF_SECBOOT_PAIRS`];
+/// 3. the firmware QEMU bundles in its own data directories.
 fn find_ovmf_firmware(secboot: bool) -> Option<OvmfFirmware> {
+    let override_dir = std::env::var_os(OVMF_DIR_ENV).map(PathBuf::from);
+    select_ovmf_firmware(override_dir.as_deref(), secboot, qemu_data_dirs)
+}
+
+/// Pure core of [`find_ovmf_firmware`]: the environment lookup and the QEMU
+/// process spawn are supplied by the caller so tests can drive it directly.
+fn select_ovmf_firmware(
+    override_dir: Option<&Path>,
+    secboot: bool,
+    qemu_dirs: impl FnOnce() -> Vec<PathBuf>,
+) -> Option<OvmfFirmware> {
+    if let Some(dir) = override_dir {
+        match find_ovmf_in_dir(dir, secboot) {
+            Some(fw) => return Some(fw),
+            None => log::warn!(
+                "{OVMF_DIR_ENV}={} contains no {}firmware pair; falling back to auto-detection",
+                dir.display(),
+                if secboot { "Secure Boot " } else { "" }
+            ),
+        }
+    }
+
     let table = if secboot {
         OVMF_SECBOOT_PAIRS
     } else {
         OVMF_PAIRS
     };
-    for &(code, vars, format) in table {
-        if Path::new(code).exists() && Path::new(vars).exists() {
-            return Some(OvmfFirmware {
-                code: code.to_string(),
-                vars_template: vars.to_string(),
-                format,
-            });
-        }
+    if let Some(fw) = first_existing_pair(table) {
+        return Some(fw);
     }
-    None
+
+    qemu_dirs()
+        .iter()
+        .find_map(|dir| find_ovmf_in_dir(dir, secboot))
 }
 
 /// Result of creating a new VM
@@ -732,6 +863,12 @@ if [[ ! -f "$OVMF_VARS" ]]; then
     fi
 fi
 
+# cp keeps the template's mode. On a read-only store (NixOS /nix/store) that
+# leaves the copy read-only and QEMU cannot open it as writable pflash.
+if [[ -f "$OVMF_VARS" && ! -w "$OVMF_VARS" ]]; then
+    chmod u+w "$OVMF_VARS"
+fi
+
 "#,
         template = firmware.vars_template,
         ext = vars_ext
@@ -833,7 +970,8 @@ pub fn generate_launch_script_with_os<'a>(
     let needs_uefi = config.uefi || is_windows_11(os_profile);
 
     // Shebang and header
-    script.push_str("#!/bin/bash\n\n");
+    // `env bash`: NixOS has no /bin/bash, and bash is on PATH everywhere else.
+    script.push_str("#!/usr/bin/env bash\n\n");
     script.push_str(&format!("# {} VM Launch Script\n", vm_name));
     script.push_str(&format!(
         "# {} CPUs, {}MB RAM, {} graphics, {} disk interface\n",

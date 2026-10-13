@@ -210,3 +210,12 @@ fn generated_scripts_are_valid_bash() {
         }
     }
 }
+
+#[test]
+fn generated_network_scripts_use_env_bash_shebang() {
+    // net-up.sh / net-down.sh are executed directly (`sudo <script>` in a
+    // terminal); a hard-coded /bin/bash does not exist on NixOS.
+    let net = lab_nat();
+    assert!(generate_up_script(&net).starts_with("#!/usr/bin/env bash\n"));
+    assert!(generate_down_script(&net).starts_with("#!/usr/bin/env bash\n"));
+}

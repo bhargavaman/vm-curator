@@ -1014,6 +1014,12 @@ fn execute_action(app: &mut App, item: SettingsItem) -> anyhow::Result<()> {
             SystemSetupResult::Launched => {
                 app.set_status("Setup launched in terminal window. Follow the prompts there.");
             }
+            SystemSetupResult::LaunchedNixos { module_path } => {
+                app.set_status(format!(
+                    "NixOS: module written to {} — add it to your configuration and rebuild (see terminal).",
+                    module_path.display()
+                ));
+            }
             SystemSetupResult::NoTerminal => {
                 app.set_status("No terminal found. Install alacritty, kitty, ghostty, konsole, or gnome-terminal.");
             }

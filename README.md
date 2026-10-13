@@ -9,6 +9,12 @@ A fast and friendly Rust TUI for managing desktop QEMU/KVM virtual machines — 
 - **Fix Duplicated Disks in VM Info** (thanks @adonespitogo, #86): Disk parsing is scoped to the default boot invocation of `launch.sh`, so drives from the `--install`/`--cdrom` branches no longer show up as duplicates or literal `$2` paths
 - **Fix VMs on a Managed Network Losing Connectivity** (thanks @adonespitogo, #87): `net-up.sh` now tells NetworkManager to leave vm-curator's bridges and tap devices unmanaged, so it can no longer silently detach a VM's tap from the bridge
 - **Find `qemu-bridge-helper` on NixOS** (thanks @pimkoter, #89): The bridge-helper lookup also checks `/run/wrappers/bin`
+- **UEFI Firmware Detection Without libvirt (NixOS)**: Firmware lookup now falls back to the edk2 images QEMU bundles in its own data directory (`qemu-system-x86_64 -L help`), so UEFI and Windows 11 VMs boot on a plain NixOS host without `virtualisation.libvirtd`; a new `VM_CURATOR_OVMF_DIR` variable overrides auto-detection anywhere
+- **Fix `OVMF_VARS.fd: Permission denied` on NixOS**: The per-VM UEFI variables copy inherited the Nix store's read-only mode; generated scripts now `chmod u+w` it, and launching repairs VMs created before the fix
+- **Single-GPU Passthrough Setup for NixOS**: The one-time setup writes a self-contained Nix module to `~/.config/vm-curator/single-gpu-vfio.nix` with import/rebuild instructions instead of dropping files in `/etc/modprobe.d` and hunting for an initramfs tool; it also offers to remove stray files from an earlier run
+- **Fix Single-GPU Start Script Not Killing niri/Hyprland**: Both compositors are now matched (`Hyprland` is capitalised), so the GPU driver can actually unload on those desktops
+- **Per-VM Launch Log**: Every launch writes `<vm>/qemu.log` (timestamp, exact command, and everything QEMU prints for the life of the VM; previous run kept as `qemu.log.old`), and launch failures now point at it
+- **Fix Generated Scripts Not Executable on NixOS**: All generated scripts use `#!/usr/bin/env bash`, so running `./launch.sh` by hand and the sudo-executed network and single-GPU scripts work where `/bin/bash` doesn't exist
 
 **v1.4.0**
 - **Physical Disk Passthrough as Boot Device** (#80): Pass whole NVMe/SATA/USB disks straight through to guests — a new **Physical Disk** mode in the creation wizard (with a safety-filtered picker that excludes the host system disk, mounted disks, and LVM/swap members) and a **Passthrough Disks** management screen for existing VMs, with per-disk boot index; USB passthrough gains a boot-index option too. Also fixes a latent bug where Fedora's qcow2 OVMF firmware could be mistaken for the VM's disk — letting Reset VM delete it
@@ -215,7 +221,7 @@ The binary will be at `target/release/vm-curator`.
 - **Required**: QEMU (`qemu-system-*` binaries), qemu-img (for disk creation and snapshots), libudev
 - **Build**: a recent Rust stable toolchain (see `rust-toolchain.toml`), libudev-dev (Debian/Ubuntu) or systemd-libs (Arch/Fedora)
 - **Optional**:
-  - OVMF/edk2 — UEFI boot support (`edk2-ovmf` on Arch, `ovmf` on Debian/Ubuntu)
+  - OVMF/edk2 — UEFI boot support (`edk2-ovmf` on Arch, `ovmf` on Debian/Ubuntu); not needed where QEMU's bundled edk2 firmware is used (e.g. NixOS)
   - swtpm — TPM 2.0 emulation (required for Windows 11 VMs)
   - virt-viewer — SPICE-app display backend
   - passt — passt network backend
@@ -358,7 +364,8 @@ VMs are expected in your library directory (default `~/vm-space/`) with this str
 ~/vm-space/
 ├── windows-95/
 │   ├── launch.sh      # QEMU launch script (required)
-│   └── disk.qcow2     # Disk image (qcow2 recommended for snapshots)
+│   ├── disk.qcow2     # Disk image (qcow2 recommended for snapshots)
+│   └── qemu.log       # Output of the last launch (command + stdout/stderr); qemu.log.old = the one before
 ├── linux-debian/
 │   ├── launch.sh
 │   ├── disk.qcow2
@@ -444,8 +451,12 @@ VM Curator automatically detects OVMF/UEFI firmware as matched CODE+VARS pairs (
 - Arch Linux: `/usr/share/edk2/x64/OVMF_CODE.4m.fd`
 - Debian/Ubuntu: `/usr/share/OVMF/OVMF_CODE_4M.fd`
 - Fedora/RHEL: `/usr/share/edk2/ovmf/OVMF_CODE_4M.qcow2`
-- NixOS: Multiple search paths supported
+- NixOS and any other host without an FHS OVMF package: the edk2 firmware QEMU bundles in its own data directory (`qemu-system-x86_64 -L help`) — no libvirt required
 - And more...
+
+**Single-GPU passthrough on NixOS**: the one-time system setup (Settings → *Run Setup*) does not write to `/etc` or regenerate an initramfs on NixOS. It writes a ready-to-import module to `~/.config/vm-curator/single-gpu-vfio.nix` (IOMMU kernel params for your CPU, VFIO modules, `softdep`/`vfio_pci` options); copy it into your configuration repository, add it to `imports`, `nixos-rebuild switch`, reboot. The runtime `single-gpu-start.sh`/`-restore.sh` scripts work unchanged (they use `systemctl stop display-manager`, which is the NixOS unit name).
+
+To pin a specific firmware build, or on a host whose firmware lives somewhere unusual, set `VM_CURATOR_OVMF_DIR` to a directory containing a CODE+VARS pair (`OVMF_CODE*.fd`/`OVMF_VARS*.fd` or QEMU's `edk2-x86_64-code.fd`/`edk2-i386-vars.fd`). It is checked before every built-in path. On NixOS, for example: `VM_CURATOR_OVMF_DIR="${pkgs.OVMF.fd}/FV"`.
 
 ---
 
