@@ -15,6 +15,7 @@ A fast and friendly Rust TUI for managing desktop QEMU/KVM virtual machines — 
 - **Fix Single-GPU Start Script Not Killing niri/Hyprland**: Both compositors are now matched (`Hyprland` is capitalised), so the GPU driver can actually unload on those desktops
 - **Per-VM Launch Log**: Every launch writes `<vm>/qemu.log` (timestamp, exact command, and everything QEMU prints for the life of the VM; previous run kept as `qemu.log.old`), and launch failures now point at it
 - **Fix Generated Scripts Not Executable on NixOS**: All generated scripts use `#!/usr/bin/env bash`, so running `./launch.sh` by hand and the sudo-executed network and single-GPU scripts work where `/bin/bash` doesn't exist
+- **Fix Create/Edit Network Form Hiding How to Save** (thanks @sae-lco, #100): The form gains a `[ Save ] [ Cancel ]` button row (Enter activates), and its help text wraps and stays visible on narrow or short terminals instead of clipping off the `[s] Save` hint
 
 **v1.4.0**
 - **Physical Disk Passthrough as Boot Device** (#80): Pass whole NVMe/SATA/USB disks straight through to guests — a new **Physical Disk** mode in the creation wizard (with a safety-filtered picker that excludes the host system disk, mounted disks, and LVM/swap members) and a **Passthrough Disks** management screen for existing VMs, with per-disk boot index; USB passthrough gains a boot-index option too. Also fixes a latent bug where Fedora's qcow2 OVMF firmware could be mistaken for the VM's disk — letting Reset VM delete it

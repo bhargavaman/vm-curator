@@ -11,7 +11,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout},
     prelude::*,
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
 use crate::app::{App, ConfirmAction, Screen, VNetEditorState};
@@ -41,14 +41,20 @@ pub fn render(app: &App, frame: &mut Frame) {
         ])
         .split(inner);
 
+    const LIST_HELP: &str =
+        "[c] Create  [e] Edit  [d] Delete  [Enter] Start/Stop  [r] Refresh  [Esc] Back";
+    // Reserve exactly the rows the help needs at this width so a narrow
+    // terminal wraps it instead of clipping the last hints (#100).
+    let help_rows = wrapped_rows(LIST_HELP, h_chunks[1].width);
+
     let v_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // Header/intro
-            Constraint::Length(1), // Spacer
-            Constraint::Min(4),    // Network list
-            Constraint::Length(4), // Notes
-            Constraint::Length(2), // Help
+            Constraint::Length(1),         // Header/intro
+            Constraint::Length(1),         // Spacer
+            Constraint::Min(4),            // Network list
+            Constraint::Length(4),         // Notes
+            Constraint::Length(help_rows), // Help
         ])
         .split(h_chunks[1]);
 
@@ -109,11 +115,10 @@ pub fn render(app: &App, frame: &mut Frame) {
     .style(Style::default().fg(Color::DarkGray));
     frame.render_widget(notes, v_chunks[3]);
 
-    let help = Paragraph::new(
-        "[c] Create  [e] Edit  [d] Delete  [Enter] Start/Stop  [r] Refresh  [Esc] Back",
-    )
-    .style(Style::default().fg(Color::DarkGray))
-    .alignment(Alignment::Center);
+    let help = Paragraph::new(LIST_HELP)
+        .style(Style::default().fg(Color::DarkGray))
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true });
     frame.render_widget(help, v_chunks[4]);
 
     // Create/edit form overlays the list
@@ -122,10 +127,84 @@ pub fn render(app: &App, frame: &mut Frame) {
     }
 }
 
+/// Help shown under the form while a text field is being typed into.
+const EDITOR_HELP_TYPING: &str = "[Enter] Done  [Esc] Cancel edit";
+/// Help shown under the form otherwise. Two lines so the way to finish the
+/// form is never the part that gets clipped on a narrow terminal (#100).
+const EDITOR_HELP: &str =
+    "[j/k/Tab] Field  [Enter] Edit/toggle  [←/→] Change\n[s] Save  [Esc] Cancel";
+
+/// Rows needed to show `text` wrapped at `width` columns (word-wrap
+/// estimate: each line of `text` costs ceil(chars / width), minimum one).
+/// Width 0 counts as one row per line so layouts stay sane while resizing.
+fn wrapped_rows(text: &str, width: u16) -> u16 {
+    let width = width.max(1) as usize;
+    text.lines()
+        .map(|line| {
+            let chars = line.chars().count();
+            if chars == 0 {
+                1
+            } else {
+                chars.div_ceil(width)
+            }
+        })
+        .sum::<usize>()
+        .max(1) as u16
+}
+
+/// Rows of the form, in order, inside the editor dialog's inner area.
+struct EditorLayout {
+    fields: [Rect; 4],
+    actions: Rect,
+    info: Rect,
+    help: Rect,
+}
+
+/// Split the editor's inner area so the fields come first, the help is
+/// anchored to the bottom with the rows it needs at this width, and the
+/// info/error text takes whatever is left (shrinking first when the terminal
+/// is short). Nothing the user must see is dropped before the info text.
+fn editor_layout(inner: Rect, help_rows: u16) -> EditorLayout {
+    // One-column side margin matches the previous look.
+    let x = inner.x + 1;
+    let width = inner.width.saturating_sub(2);
+    // Rows past the bottom collapse to zero height so nothing is ever drawn
+    // outside the dialog (ratatui panics on out-of-buffer rects).
+    let row = |y: u16| {
+        if y < inner.bottom() {
+            Rect::new(x, y, width, 1)
+        } else {
+            Rect::new(x, inner.bottom(), width, 0)
+        }
+    };
+
+    let mut y = inner.y;
+    let fields = [row(y), row(y + 1), row(y + 2), row(y + 3)];
+    y += 4;
+    // Spacer, then the button row.
+    y += 1;
+    let actions = row(y);
+    y += 2; // button row + spacer
+
+    let help_rows = help_rows.min(inner.height);
+    let help_y = inner.bottom().saturating_sub(help_rows);
+    let help = Rect::new(x, help_y, width, help_rows);
+
+    let info_h = help_y.saturating_sub(y);
+    let info = Rect::new(x, y, width, info_h);
+
+    EditorLayout {
+        fields,
+        actions,
+        info,
+        help,
+    }
+}
+
 fn render_editor(editor: &VNetEditorState, frame: &mut Frame) {
     let area = frame.area();
-    let dialog_width = 56.min(area.width.saturating_sub(6));
-    let dialog_height = 15.min(area.height.saturating_sub(6));
+    let dialog_width = 64.min(area.width.saturating_sub(4));
+    let dialog_height = 17.min(area.height.saturating_sub(2));
     let dialog_area = centered_rect(dialog_width, dialog_height, area);
     frame.render_widget(Clear, dialog_area);
 
@@ -142,19 +221,15 @@ fn render_editor(editor: &VNetEditorState, frame: &mut Frame) {
     let inner = block.inner(dialog_area);
     frame.render_widget(block, dialog_area);
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .margin(1)
-        .constraints([
-            Constraint::Length(1), // Name
-            Constraint::Length(1), // Type
-            Constraint::Length(1), // Subnet
-            Constraint::Length(1), // DHCP
-            Constraint::Length(1), // Spacer
-            Constraint::Length(3), // Info / error
-            Constraint::Length(2), // Help
-        ])
-        .split(inner);
+    let help_text = if editor.editing {
+        EDITOR_HELP_TYPING
+    } else {
+        EDITOR_HELP
+    };
+    let layout = editor_layout(
+        inner,
+        wrapped_rows(help_text, inner.width.saturating_sub(2)),
+    );
 
     let field = |label: &str, value: String, focus: usize| -> Line<'static> {
         let focused = editor.field_focus == focus;
@@ -190,27 +265,61 @@ fn render_editor(editor: &VNetEditorState, frame: &mut Frame) {
     } else {
         editor.name.clone()
     };
-    frame.render_widget(Paragraph::new(field("Name:", name_value, 0)), chunks[0]);
+    frame.render_widget(
+        Paragraph::new(field("Name:", name_value, VNetEditorState::FIELD_NAME)),
+        layout.fields[0],
+    );
     frame.render_widget(
         Paragraph::new(field(
             "Type:",
             format!("[ {} ]  (←/→ toggle)", editor.kind.label()),
-            1,
+            VNetEditorState::FIELD_TYPE,
         )),
-        chunks[1],
+        layout.fields[1],
     );
     frame.render_widget(
-        Paragraph::new(field("Subnet:", editor.subnet.clone(), 2)),
-        chunks[2],
+        Paragraph::new(field(
+            "Subnet:",
+            editor.subnet.clone(),
+            VNetEditorState::FIELD_SUBNET,
+        )),
+        layout.fields[2],
     );
     frame.render_widget(
         Paragraph::new(field(
             "DHCP:",
             format!("[{}]", if editor.dhcp { "on" } else { "off" }),
-            3,
+            VNetEditorState::FIELD_DHCP,
         )),
-        chunks[3],
+        layout.fields[3],
     );
+
+    // Button row: a visible way to finish the form (#100). `s`/`Esc` still work.
+    let on_actions = editor.field_focus == VNetEditorState::FIELD_ACTIONS;
+    let button = |label: &str, active: bool| -> Span<'static> {
+        let style = if on_actions && active {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else if on_actions {
+            Style::default().fg(Color::White)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        Span::styled(format!("[ {} ]", label), style)
+    };
+    let actions = Line::from(vec![
+        Span::styled(
+            if on_actions { "> " } else { "  " }.to_string(),
+            Style::default().fg(Color::Yellow),
+        ),
+        Span::styled(format!("{:<9}", ""), Style::default()),
+        button("Save", !editor.action_cancel),
+        Span::raw("   "),
+        button("Cancel", editor.action_cancel),
+    ]);
+    frame.render_widget(Paragraph::new(actions), layout.actions);
 
     let info = if let Some(err) = &editor.error {
         Paragraph::new(err.clone()).style(Style::default().fg(Color::Red))
@@ -221,17 +330,13 @@ fn render_editor(editor: &VNetEditorState, frame: &mut Frame) {
         )
         .style(Style::default().fg(Color::DarkGray))
     };
-    frame.render_widget(info, chunks[5]);
+    frame.render_widget(info.wrap(Wrap { trim: true }), layout.info);
 
-    let help_text = if editor.editing {
-        "[Enter] Done  [Esc] Cancel edit"
-    } else {
-        "[j/k] Field  [Enter/Tab] Edit field  [←/→] Toggle  [s] Save  [Esc] Cancel"
-    };
     let help = Paragraph::new(help_text)
         .style(Style::default().fg(Color::DarkGray))
-        .alignment(Alignment::Center);
-    frame.render_widget(help, chunks[6]);
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true });
+    frame.render_widget(help, layout.help);
 }
 
 pub fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
@@ -290,57 +395,62 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     Ok(())
 }
 
+/// What the editor wants the app to do after a key (pure form logic is in
+/// [`apply_editor_key`] so it can be tested without an `App`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditorAction {
+    None,
+    Save,
+    Cancel,
+}
+
 fn handle_editor_key(app: &mut App, key: KeyEvent) -> Result<()> {
-    let in_text_edit = app.vnet_editor.as_ref().map(|e| e.editing).unwrap_or(false);
-
-    if in_text_edit {
-        if let Some(editor) = app.vnet_editor.as_mut() {
-            match key.code {
-                KeyCode::Esc => {
-                    editor.editing = false;
-                    editor.edit_buffer.clear();
-                }
-                KeyCode::Enter | KeyCode::Tab => {
-                    let value = editor.edit_buffer.trim().to_string();
-                    match editor.field_focus {
-                        0 => editor.name = value,
-                        2 => editor.subnet = value,
-                        _ => {}
-                    }
-                    editor.editing = false;
-                    editor.edit_buffer.clear();
-                }
-                KeyCode::Backspace => {
-                    editor.edit_buffer.pop();
-                }
-                KeyCode::Char(c) if !c.is_whitespace() => {
-                    editor.edit_buffer.push(c);
-                }
-                _ => {}
-            }
-        }
-        return Ok(());
-    }
-
-    // App-level actions first (they need `app` unborrowed)
-    match key.code {
-        KeyCode::Esc => {
-            app.vnet_editor = None;
-            return Ok(());
-        }
-        KeyCode::Char('s') | KeyCode::Char('S') => {
-            save_editor(app);
-            return Ok(());
-        }
-        _ => {}
-    }
-
-    let Some(editor) = app.vnet_editor.as_mut() else {
-        return Ok(());
+    let action = match app.vnet_editor.as_mut() {
+        Some(editor) => apply_editor_key(editor, key.code),
+        None => return Ok(()),
     };
-    match key.code {
+    match action {
+        EditorAction::None => {}
+        EditorAction::Save => save_editor(app),
+        EditorAction::Cancel => app.vnet_editor = None,
+    }
+    Ok(())
+}
+
+/// Apply a key to the form state and report whether it should save or close.
+fn apply_editor_key(editor: &mut VNetEditorState, code: KeyCode) -> EditorAction {
+    if editor.editing {
+        match code {
+            KeyCode::Esc => {
+                editor.editing = false;
+                editor.edit_buffer.clear();
+            }
+            KeyCode::Enter | KeyCode::Tab => {
+                let value = editor.edit_buffer.trim().to_string();
+                match editor.field_focus {
+                    VNetEditorState::FIELD_NAME => editor.name = value,
+                    VNetEditorState::FIELD_SUBNET => editor.subnet = value,
+                    _ => {}
+                }
+                editor.editing = false;
+                editor.edit_buffer.clear();
+            }
+            KeyCode::Backspace => {
+                editor.edit_buffer.pop();
+            }
+            KeyCode::Char(c) if !c.is_whitespace() => {
+                editor.edit_buffer.push(c);
+            }
+            _ => {}
+        }
+        return EditorAction::None;
+    }
+
+    match code {
+        KeyCode::Esc => return EditorAction::Cancel,
+        KeyCode::Char('s') | KeyCode::Char('S') => return EditorAction::Save,
         KeyCode::Char('j') | KeyCode::Down => {
-            if editor.field_focus < 3 {
+            if editor.field_focus + 1 < VNetEditorState::FIELD_COUNT {
                 editor.field_focus += 1;
             }
         }
@@ -349,27 +459,44 @@ fn handle_editor_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 editor.field_focus -= 1;
             }
         }
+        // Tab walks the rows (wrapping), so from the DHCP toggle the next Tab
+        // lands on the Save button.
+        KeyCode::Tab => {
+            editor.field_focus = (editor.field_focus + 1) % VNetEditorState::FIELD_COUNT;
+        }
+        KeyCode::BackTab => {
+            editor.field_focus = (editor.field_focus + VNetEditorState::FIELD_COUNT - 1)
+                % VNetEditorState::FIELD_COUNT;
+        }
         KeyCode::Left | KeyCode::Right => match editor.field_focus {
-            1 => editor.kind = editor.kind.toggle(),
-            3 => editor.dhcp = !editor.dhcp,
+            VNetEditorState::FIELD_TYPE => editor.kind = editor.kind.toggle(),
+            VNetEditorState::FIELD_DHCP => editor.dhcp = !editor.dhcp,
+            VNetEditorState::FIELD_ACTIONS => editor.action_cancel = !editor.action_cancel,
             _ => {}
         },
-        KeyCode::Enter | KeyCode::Tab => match editor.field_focus {
-            0 if editor.original_name.is_none() => {
+        KeyCode::Enter => match editor.field_focus {
+            VNetEditorState::FIELD_NAME if editor.original_name.is_none() => {
                 editor.editing = true;
                 editor.edit_buffer = editor.name.clone();
             }
-            2 => {
+            VNetEditorState::FIELD_SUBNET => {
                 editor.editing = true;
                 editor.edit_buffer = editor.subnet.clone();
             }
-            1 => editor.kind = editor.kind.toggle(),
-            3 => editor.dhcp = !editor.dhcp,
+            VNetEditorState::FIELD_TYPE => editor.kind = editor.kind.toggle(),
+            VNetEditorState::FIELD_DHCP => editor.dhcp = !editor.dhcp,
+            VNetEditorState::FIELD_ACTIONS => {
+                return if editor.action_cancel {
+                    EditorAction::Cancel
+                } else {
+                    EditorAction::Save
+                };
+            }
             _ => {}
         },
         _ => {}
     }
-    Ok(())
+    EditorAction::None
 }
 
 /// Build the network from the form, save it, and close the editor.
@@ -485,4 +612,174 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     Rect::new(x, y, width, height)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vnet::VNetKind;
+
+    // --- help-bar measurement (#100) ---
+
+    #[test]
+    fn wrapped_rows_fits_on_one_line_when_wide_enough() {
+        assert_eq!(wrapped_rows("[s] Save  [Esc] Cancel", 80), 1);
+    }
+
+    #[test]
+    fn wrapped_rows_grows_on_narrow_terminals() {
+        // 22 chars at width 10 -> 3 rows
+        assert_eq!(wrapped_rows("[s] Save  [Esc] Cancel", 10), 3);
+        // Each line of a multi-line help is measured separately.
+        assert_eq!(wrapped_rows(EDITOR_HELP, 80), 2);
+        assert_eq!(wrapped_rows(EDITOR_HELP, 20), 3 + 2);
+        assert_eq!(wrapped_rows("", 40), 1);
+        assert_eq!(wrapped_rows("abc", 0), 3);
+    }
+
+    #[test]
+    fn editor_help_fits_the_default_dialog_width() {
+        // Dialog 64 wide, borders 2, side margin 2 -> 60 usable columns.
+        for line in EDITOR_HELP.lines() {
+            assert!(line.chars().count() <= 60, "help line too long: {line}");
+        }
+    }
+
+    // --- layout: help is never the thing that gets dropped ---
+
+    #[test]
+    fn editor_layout_anchors_help_to_the_bottom() {
+        let inner = Rect::new(2, 3, 62, 15);
+        let l = editor_layout(inner, 2);
+        assert_eq!(l.fields[0].y, 3);
+        assert_eq!(l.fields[3].y, 6);
+        assert_eq!(l.actions.y, 8);
+        assert_eq!(l.help.height, 2);
+        assert_eq!(l.help.bottom(), inner.bottom());
+        assert_eq!(l.info.y, 10);
+        assert_eq!(l.info.bottom(), l.help.y);
+        assert!(l.info.height >= 2, "info keeps room on a normal dialog");
+    }
+
+    #[test]
+    fn editor_layout_keeps_help_visible_on_a_short_terminal() {
+        // The reporter's terminal: ~15 rows -> dialog 13 -> inner 11.
+        let inner = Rect::new(0, 0, 50, 11);
+        let l = editor_layout(inner, 2);
+        assert_eq!(l.help.height, 2);
+        assert_eq!(l.help.bottom(), 11);
+        // Info is what gives way, not the buttons or help.
+        assert_eq!(l.actions.y, 5);
+        assert_eq!(l.info.height, 11 - 2 - 7);
+        // Even absurdly short: nothing panics, help still has its rows, and
+        // no row is placed outside the dialog.
+        let tiny = editor_layout(Rect::new(0, 0, 50, 3), 2);
+        assert_eq!(tiny.help.height, 2);
+        assert_eq!(tiny.info.height, 0);
+        assert!(tiny.actions.bottom() <= 3);
+        assert!(tiny.fields.iter().all(|r| r.bottom() <= 3));
+        assert_eq!(tiny.actions.height, 0);
+    }
+
+    // --- form key handling ---
+
+    fn fresh() -> VNetEditorState {
+        VNetEditorState::new_network()
+    }
+
+    #[test]
+    fn focus_walks_down_to_the_button_row_and_stops() {
+        let mut e = fresh();
+        for _ in 0..10 {
+            apply_editor_key(&mut e, KeyCode::Char('j'));
+        }
+        assert_eq!(e.field_focus, VNetEditorState::FIELD_ACTIONS);
+        for _ in 0..10 {
+            apply_editor_key(&mut e, KeyCode::Char('k'));
+        }
+        assert_eq!(e.field_focus, VNetEditorState::FIELD_NAME);
+    }
+
+    #[test]
+    fn tab_wraps_from_dhcp_to_save_button() {
+        let mut e = fresh();
+        e.field_focus = VNetEditorState::FIELD_DHCP;
+        assert_eq!(apply_editor_key(&mut e, KeyCode::Tab), EditorAction::None);
+        assert_eq!(e.field_focus, VNetEditorState::FIELD_ACTIONS);
+        apply_editor_key(&mut e, KeyCode::Tab);
+        assert_eq!(e.field_focus, VNetEditorState::FIELD_NAME);
+        apply_editor_key(&mut e, KeyCode::BackTab);
+        assert_eq!(e.field_focus, VNetEditorState::FIELD_ACTIONS);
+    }
+
+    #[test]
+    fn enter_on_save_button_saves_and_on_cancel_button_cancels() {
+        let mut e = fresh();
+        e.field_focus = VNetEditorState::FIELD_ACTIONS;
+        assert!(!e.action_cancel, "Save is highlighted by default");
+        assert_eq!(apply_editor_key(&mut e, KeyCode::Enter), EditorAction::Save);
+
+        apply_editor_key(&mut e, KeyCode::Right);
+        assert!(e.action_cancel);
+        assert_eq!(
+            apply_editor_key(&mut e, KeyCode::Enter),
+            EditorAction::Cancel
+        );
+
+        apply_editor_key(&mut e, KeyCode::Left);
+        assert!(!e.action_cancel);
+    }
+
+    #[test]
+    fn s_and_esc_still_finish_the_form_from_any_field() {
+        let mut e = fresh();
+        e.field_focus = VNetEditorState::FIELD_SUBNET;
+        assert_eq!(
+            apply_editor_key(&mut e, KeyCode::Char('s')),
+            EditorAction::Save
+        );
+        assert_eq!(apply_editor_key(&mut e, KeyCode::Esc), EditorAction::Cancel);
+    }
+
+    #[test]
+    fn enter_on_fields_edits_or_toggles_without_saving() {
+        let mut e = fresh();
+        assert_eq!(apply_editor_key(&mut e, KeyCode::Enter), EditorAction::None);
+        assert!(e.editing, "Enter on Name starts typing");
+        for c in "lab".chars() {
+            apply_editor_key(&mut e, KeyCode::Char(c));
+        }
+        assert_eq!(apply_editor_key(&mut e, KeyCode::Enter), EditorAction::None);
+        assert!(!e.editing);
+        assert_eq!(e.name, "lab");
+
+        e.field_focus = VNetEditorState::FIELD_TYPE;
+        apply_editor_key(&mut e, KeyCode::Enter);
+        assert_eq!(e.kind, VNetKind::Isolated);
+        apply_editor_key(&mut e, KeyCode::Right);
+        assert_eq!(e.kind, VNetKind::Nat);
+
+        e.field_focus = VNetEditorState::FIELD_DHCP;
+        apply_editor_key(&mut e, KeyCode::Enter);
+        assert!(!e.dhcp);
+    }
+
+    #[test]
+    fn esc_while_typing_only_cancels_the_edit() {
+        let mut e = fresh();
+        apply_editor_key(&mut e, KeyCode::Enter);
+        apply_editor_key(&mut e, KeyCode::Char('x'));
+        assert_eq!(apply_editor_key(&mut e, KeyCode::Esc), EditorAction::None);
+        assert!(!e.editing);
+        assert_eq!(e.name, "", "buffer discarded, form still open");
+    }
+
+    #[test]
+    fn name_is_fixed_when_editing_an_existing_network() {
+        let net = VirtualNetwork::with_defaults("lab", VNetKind::Nat, "10.10.0.0/24").unwrap();
+        let mut e = VNetEditorState::edit(&net);
+        e.field_focus = VNetEditorState::FIELD_NAME;
+        apply_editor_key(&mut e, KeyCode::Enter);
+        assert!(!e.editing);
+    }
 }
