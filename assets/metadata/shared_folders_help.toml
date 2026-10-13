@@ -2,14 +2,18 @@
 #
 # Tier-based instructions for mounting shared folders in guest VMs.
 # Users can override at: ~/.config/vm-curator/metadata/shared_folders_help.toml
-# Use {TAG} as placeholder for the mount tag name.
+# Use {TAG} as placeholder for the mount tag name (9p tiers).
+# SMB tiers (`smb_<tier>`, fallback `smb`) may use {SHARE} for the guest-side
+# UNC path and {PATH} for the shared host directory.
 
 [empty_state]
 title = "No Shared Folders"
 description = """
 No shared folders configured.\n\
 Press [a] to share a host directory with this VM.\n\
-Shared folders use virtio-9p for host-to-guest file sharing."""
+Folders are shared over virtio-9p by default; press [m] on a folder to\n\
+switch it to SMB (QEMU's built-in SMB server), which Windows guests can\n\
+open with no driver install."""
 
 [linux]
 title = "Mounting in Guest (Linux)"
@@ -34,6 +38,9 @@ OpenBSD / NetBSD:\n\
 [windows]
 title = "Mounting in Guest (Windows)"
 description = """
+Windows has no built-in 9p driver. Tip: select the folder and press [m]\n\
+to switch it to SMB mode, which Windows opens natively.\n\
+To use 9p anyway:\n\
 1. Install WinFSP: https://winfsp.dev/\n\
 2. Install virtio-win guest tools:\n\
    https://github.com/virtio-win/virtio-win-pkg-scripts\n\
@@ -74,3 +81,54 @@ title = "Mount Instructions"
 description = """
 Mount command varies by OS. General syntax:\n\
   mount -t 9p -o trans=virtio {TAG} /mnt/{TAG}"""
+
+# ---------------------------------------------------------------------------
+# SMB mode: QEMU's built-in SMB server on the user-mode netdev. The host needs
+# the samba package (QEMU spawns /usr/sbin/smbd on demand); the guest reaches
+# the share at {SHARE} with no driver install.
+# ---------------------------------------------------------------------------
+
+[smb]
+title = "Opening the SMB share in Guest"
+description = """
+The guest sees {PATH} at {SHARE} (no driver needed).\n\
+Linux:   sudo mount -t cifs //10.0.2.4/qemu /mnt/host -o guest,uid=$(id -u)\n\
+Windows: open {SHARE} in Explorer, or: net use Z: {SHARE}\n\
+macOS:   Finder > Go > Connect to Server > smb://10.0.2.4/qemu\n\
+Host needs the samba package installed (QEMU runs smbd on demand)."""
+
+[smb_windows]
+title = "Opening the SMB share in Guest (Windows)"
+description = """
+Open {SHARE} in File Explorer, or map a drive:\n\
+  net use Z: {SHARE}\n\
+If Windows says the share is inaccessible (guest access blocked — the\n\
+default on Windows 11 24H2 Pro and on Enterprise/Education), allow it:\n\
+  reg add HKLM\\SYSTEM\\CurrentControlSet\\Services\\LanmanWorkstation\\Parameters\n\
+    /v AllowInsecureGuestAuth /t REG_DWORD /d 1 /f\n\
+then reconnect. Host needs the samba package (QEMU runs smbd on demand)."""
+
+[smb_linux]
+title = "Opening the SMB share in Guest (Linux)"
+description = """
+sudo mkdir -p /mnt/host\n\
+sudo mount -t cifs //10.0.2.4/qemu /mnt/host -o guest,uid=$(id -u),gid=$(id -g)\n\
+(needs cifs-utils). For /etc/fstab:\n\
+//10.0.2.4/qemu  /mnt/host  cifs  guest,uid=1000,nofail,_netdev  0  0\n\
+Host needs the samba package installed (QEMU runs smbd on demand)."""
+
+[smb_macos]
+title = "Opening the SMB share in Guest (macOS)"
+description = """
+Finder > Go > Connect to Server (Cmd+K) > smb://10.0.2.4/qemu\n\
+Connect as Guest. Or in Terminal:\n\
+  mkdir -p ~/host && mount_smbfs //guest@10.0.2.4/qemu ~/host\n\
+Host needs the samba package installed (QEMU runs smbd on demand)."""
+
+[smb_bsd]
+title = "Opening the SMB share in Guest (BSD)"
+description = """
+FreeBSD:\n\
+  kldload smbfs\n\
+  mkdir -p /mnt/host && mount_smbfs -N //guest@10.0.2.4/qemu /mnt/host\n\
+Host needs the samba package installed (QEMU runs smbd on demand)."""

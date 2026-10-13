@@ -1,8 +1,9 @@
 //! Shared Folders Screen
 //!
-//! Manages virtio-9p shared folders between host and guest VM.
+//! Manages shared folders between host and guest VM — virtio-9p by default,
+//! or QEMU's built-in SMB server for guests without a 9p driver (Windows).
 //! Shows configured folders, mount instructions based on OS tier,
-//! and allows adding/removing shared directories.
+//! and allows adding/removing shared directories and switching modes.
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent};
@@ -14,6 +15,7 @@ use ratatui::{
 };
 
 use crate::app::{App, ConfirmAction, FileBrowserMode, Screen, UnsavedKind};
+use crate::vm::{ShareMode, SMB_GUEST_SHARE};
 
 /// Render the shared folders screen
 pub fn render(app: &App, frame: &mut Frame) {
@@ -84,16 +86,18 @@ pub fn render(app: &App, frame: &mut Frame) {
                     Style::default().fg(Color::White)
                 };
 
+                let detail = match folder.mode {
+                    ShareMode::NineP => format!("  (9p, tag: {})", folder.mount_tag),
+                    ShareMode::Smb => format!("  (SMB, {})", SMB_GUEST_SHARE),
+                };
+
                 ListItem::new(Line::from(vec![
                     Span::styled(
                         format!("  {}. ", i + 1),
                         Style::default().fg(Color::DarkGray),
                     ),
                     Span::styled(&folder.host_path, style),
-                    Span::styled(
-                        format!("  (tag: {})", folder.mount_tag),
-                        Style::default().fg(Color::DarkGray),
-                    ),
+                    Span::styled(detail, Style::default().fg(Color::DarkGray)),
                 ]))
             })
             .collect();
@@ -114,7 +118,7 @@ pub fn render(app: &App, frame: &mut Frame) {
     render_mount_instructions(app, frame, instructions_area);
 
     // Help text
-    let help = Paragraph::new("[a] Add  [d] Remove  [s] Save  [Esc] Back")
+    let help = Paragraph::new("[a] Add  [d] Remove  [m] 9p/SMB  [s] Save  [Esc] Back")
         .style(Style::default().fg(Color::DarkGray))
         .alignment(Alignment::Center);
     frame.render_widget(help, help_area);
@@ -130,59 +134,78 @@ fn folder_list_height(app: &App) -> u16 {
     }
 }
 
-/// Render mount instructions based on the OS tier
+/// Render mount instructions based on the OS tier.
+///
+/// 9p folders get the tier's mount commands (one line per mount tag); an SMB
+/// folder gets the tier's SMB block (`smb_<tier>`, falling back to `smb`).
+/// With both kinds configured, both blocks are shown.
 fn render_mount_instructions(app: &App, frame: &mut Frame, area: Rect) {
-    let tier = get_mount_tier(app);
-
-    // Use empty_state tier if no folders configured
-    let effective_tier = if app.shared_folders.is_empty() {
-        "empty_state"
-    } else {
-        tier
-    };
-
-    let (title, description) = app.shared_folders_help.get_or_default(effective_tier);
-
-    // Expand {TAG} placeholders: lines containing {TAG} are repeated once per
-    // folder with that folder's mount tag. Lines without {TAG} render once.
-    let tags: Vec<&str> = app
-        .shared_folders
-        .iter()
-        .map(|f| f.mount_tag.as_str())
-        .collect();
-    let fallback_tag = "host_shared";
-
-    let mut expanded = String::new();
-    for line in description.lines() {
-        if line.contains("{TAG}") {
-            if tags.is_empty() {
-                expanded.push_str(&line.replace("{TAG}", fallback_tag));
-                expanded.push('\n');
-            } else {
-                for tag in &tags {
-                    expanded.push_str(&line.replace("{TAG}", tag));
-                    expanded.push('\n');
-                }
-            }
-        } else {
-            expanded.push_str(line);
-            expanded.push('\n');
-        }
-    }
-
-    // Add a note when multiple folders are configured
-    let header = if app.shared_folders.len() > 1 {
-        format!("{} (repeat for each folder):", title)
-    } else {
-        format!("{}:", title)
-    };
-
-    let content = format!("{}\n{}", header, expanded.trim_end());
+    let content = mount_instructions_text(app);
 
     let paragraph = Paragraph::new(content)
         .style(Style::default().fg(Color::White))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
+}
+
+/// The mount-instructions panel text (pure, for testing).
+pub(crate) fn mount_instructions_text(app: &App) -> String {
+    if app.shared_folders.is_empty() {
+        let (title, description) = app.shared_folders_help.get_or_default("empty_state");
+        return format!("{}:\n{}", title, description.trim_end());
+    }
+
+    let tier = get_mount_tier(app);
+    let nine_p_tags: Vec<&str> = app
+        .shared_folders
+        .iter()
+        .filter(|f| f.mode == ShareMode::NineP)
+        .map(|f| f.mount_tag.as_str())
+        .collect();
+    let smb_folder = app.shared_folders.iter().find(|f| f.mode == ShareMode::Smb);
+
+    let mut blocks: Vec<String> = Vec::new();
+
+    if !nine_p_tags.is_empty() {
+        let (title, description) = app.shared_folders_help.get_or_default(tier);
+
+        // Expand {TAG} placeholders: lines containing {TAG} are repeated once per
+        // 9p folder with that folder's mount tag. Lines without {TAG} render once.
+        let mut expanded = String::new();
+        for line in description.lines() {
+            if line.contains("{TAG}") {
+                for tag in &nine_p_tags {
+                    expanded.push_str(&line.replace("{TAG}", tag));
+                    expanded.push('\n');
+                }
+            } else {
+                expanded.push_str(line);
+                expanded.push('\n');
+            }
+        }
+
+        let header = if nine_p_tags.len() > 1 {
+            format!("{} (repeat for each folder):", title)
+        } else {
+            format!("{}:", title)
+        };
+        blocks.push(format!("{}\n{}", header, expanded.trim_end()));
+    }
+
+    if let Some(folder) = smb_folder {
+        let smb_key = format!("smb_{}", tier);
+        let (title, description) = if app.shared_folders_help.has(&smb_key) {
+            app.shared_folders_help.get_or_default(&smb_key)
+        } else {
+            app.shared_folders_help.get_or_default("smb")
+        };
+        let expanded = description
+            .replace("{SHARE}", SMB_GUEST_SHARE)
+            .replace("{PATH}", &folder.host_path);
+        blocks.push(format!("{}:\n{}", title, expanded.trim_end()));
+    }
+
+    blocks.join("\n\n")
 }
 
 /// Determine the mount instruction tier based on the selected VM's OS profile
@@ -284,6 +307,22 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Char('d') | KeyCode::Char('D') => {
             app.remove_shared_folder();
         }
+        KeyCode::Char('m') | KeyCode::Char('M') => {
+            if app.shared_folders.is_empty() {
+                app.set_status("No shared folder selected; press [a] to add one".to_string());
+            } else {
+                match app.toggle_shared_folder_mode() {
+                    Ok(ShareMode::Smb) => app.set_status(format!(
+                        "Folder set to SMB mode: guest sees it at {} (press [s] to save)",
+                        SMB_GUEST_SHARE
+                    )),
+                    Ok(ShareMode::NineP) => {
+                        app.set_status("Folder set to 9p mode (press [s] to save)".to_string())
+                    }
+                    Err(reason) => app.set_status(reason),
+                }
+            }
+        }
         KeyCode::Char('s') | KeyCode::Char('S') => {
             save_selection_and_report(app);
         }
@@ -312,6 +351,15 @@ pub(crate) fn save_selection_and_report(app: &mut App) {
                 } else {
                     "Cleared shared folders from launch.sh".to_string()
                 };
+
+                // QEMU spawns the host's smbd for SMB shares; warn now rather
+                // than letting the VM fail to start later.
+                let has_smb = app.shared_folders.iter().any(|f| f.mode == ShareMode::Smb);
+                if has_smb && !crate::vm::smbd_available() {
+                    status_msg.push_str(
+                        "; warning: smbd not found on the host — install the samba package or QEMU will refuse to start the SMB share",
+                    );
+                }
 
                 // Regenerate single-GPU scripts if they exist so their copied
                 // QEMU command stays in sync with launch.sh.

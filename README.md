@@ -15,6 +15,7 @@ A fast and friendly Rust TUI for managing desktop QEMU/KVM virtual machines — 
 - **Fix Single-GPU Start Script Not Killing niri/Hyprland**: Both compositors are now matched (`Hyprland` is capitalised), so the GPU driver can actually unload on those desktops
 - **Per-VM Launch Log**: Every launch writes `<vm>/qemu.log` (timestamp, exact command, and everything QEMU prints for the life of the VM; previous run kept as `qemu.log.old`), and launch failures now point at it
 - **Fix Generated Scripts Not Executable on NixOS**: All generated scripts use `#!/usr/bin/env bash`, so running `./launch.sh` by hand and the sudo-executed network and single-GPU scripts work where `/bin/bash` doesn't exist
+- **SMB Shared Folders for Windows Guests** (thanks @ahmutkadim, #101): Press `m` on a shared folder to switch it to QEMU's built-in SMB server — the guest opens `\\10.0.2.4\qemu` with no driver install (Windows-profile VMs default to it); needs the `samba` package on the host and user-mode networking
 
 **v1.4.0**
 - **Physical Disk Passthrough as Boot Device** (#80): Pass whole NVMe/SATA/USB disks straight through to guests — a new **Physical Disk** mode in the creation wizard (with a safety-filtered picker that excludes the host system disk, mounted disks, and LVM/swap members) and a **Passthrough Disks** management screen for existing VMs, with per-disk boot index; USB passthrough gains a boot-index option too. Also fixes a latent bug where Fedora's qcow2 OVMF firmware could be mistaken for the VM's disk — letting Reset VM delete it
@@ -92,8 +93,8 @@ A fast and friendly Rust TUI for managing desktop QEMU/KVM virtual machines — 
 - **Virtual Network Manager** (`n` on the main menu): create, edit, start/stop, and delete managed NAT or Isolated (host-only) networks with configurable subnets and built-in DHCP — ideal for multi-VM lab topologies. Host changes run via inspectable generated `net-up.sh`/`net-down.sh` scripts with explicit sudo
 
 **Shared Folders**
-- Share host directories with VMs using virtio-9p
-- Add, remove, and edit shared folders from the management menu
+- Share host directories with VMs using virtio-9p, or QEMU's built-in SMB server for guests without a 9p driver (Windows) — the guest opens `\\10.0.2.4\qemu` directly
+- Add, remove, and switch folders between 9p and SMB from the management menu; per-OS mount instructions shown in-app
 - Automatic mount tag generation
 
 **Clipboard Sharing (SPICE)**

@@ -373,7 +373,7 @@ fn test_ensure_window_size_override_in_script_reports_missing_script() {
 
 #[test]
 fn test_generate_shared_folders_section_empty() {
-    let section = generate_shared_folders_section(&[], "virtio-9p-pci");
+    let section = generate_shared_folders_section(&[], "virtio-9p-pci", None);
     assert!(section.is_empty());
 }
 
@@ -382,8 +382,9 @@ fn test_generate_shared_folders_section_single() {
     let folders = vec![SharedFolder {
         host_path: "/home/user/Documents".to_string(),
         mount_tag: "host_documents".to_string(),
+        mode: ShareMode::NineP,
     }];
-    let section = generate_shared_folders_section(&folders, "virtio-9p-pci");
+    let section = generate_shared_folders_section(&folders, "virtio-9p-pci", None);
     assert!(section.contains(SHARED_FOLDERS_MARKER_START));
     assert!(section.contains(SHARED_FOLDERS_MARKER_END));
     assert!(section.contains("SHARED_FOLDERS_ARGS=("));
@@ -399,13 +400,15 @@ fn test_generate_shared_folders_section_multiple() {
         SharedFolder {
             host_path: "/home/user/Documents".to_string(),
             mount_tag: "host_documents".to_string(),
+            mode: ShareMode::NineP,
         },
         SharedFolder {
             host_path: "/home/user/Downloads".to_string(),
             mount_tag: "host_downloads".to_string(),
+            mode: ShareMode::NineP,
         },
     ];
-    let section = generate_shared_folders_section(&folders, "virtio-9p-pci");
+    let section = generate_shared_folders_section(&folders, "virtio-9p-pci", None);
     assert!(section.contains("fsdev0"));
     assert!(section.contains("fsdev1"));
     assert!(section.contains("mount_tag=host_documents"));
@@ -417,8 +420,9 @@ fn test_generate_shared_folders_section_arm() {
     let folders = vec![SharedFolder {
         host_path: "/tmp/share".to_string(),
         mount_tag: "host_share".to_string(),
+        mode: ShareMode::NineP,
     }];
-    let section = generate_shared_folders_section(&folders, "virtio-9p-device");
+    let section = generate_shared_folders_section(&folders, "virtio-9p-device", None);
     assert!(section.contains("virtio-9p-device"));
     assert!(!section.contains("virtio-9p-pci"));
 }
@@ -428,8 +432,9 @@ fn test_generate_shared_folders_section_path_with_spaces() {
     let folders = vec![SharedFolder {
         host_path: "/home/user/My Documents".to_string(),
         mount_tag: "host_my_documents".to_string(),
+        mode: ShareMode::NineP,
     }];
-    let section = generate_shared_folders_section(&folders, "virtio-9p-pci");
+    let section = generate_shared_folders_section(&folders, "virtio-9p-pci", None);
     assert!(section.contains("path=/home/user/My Documents"));
     assert!(section.contains("SHARED_FOLDERS_ARGS=("));
 }
@@ -511,8 +516,9 @@ fn test_insert_shared_folders_section_simple() {
     let folders = vec![SharedFolder {
         host_path: "/tmp".to_string(),
         mount_tag: "host_tmp".to_string(),
+        mode: ShareMode::NineP,
     }];
-    let section = generate_shared_folders_section(&folders, "virtio-9p-pci");
+    let section = generate_shared_folders_section(&folders, "virtio-9p-pci", None);
     let result = insert_shared_folders_section(content, &section);
     assert!(result.contains(SHARED_FOLDERS_MARKER_START));
     assert!(result.contains(SHARED_FOLDERS_ARGS_REF));
@@ -576,6 +582,7 @@ esac
     let folders = vec![SharedFolder {
         host_path: "/home/user/shared".to_string(),
         mount_tag: "host_shared".to_string(),
+        mode: ShareMode::NineP,
     }];
 
     save_shared_folders(&vm, &folders).unwrap();
@@ -596,13 +603,15 @@ fn test_roundtrip_shared_folders() {
         SharedFolder {
             host_path: "/home/user/Documents".to_string(),
             mount_tag: "host_documents".to_string(),
+            mode: ShareMode::NineP,
         },
         SharedFolder {
             host_path: "/home/user/My Pictures".to_string(),
             mount_tag: "host_my_pictures".to_string(),
+            mode: ShareMode::NineP,
         },
     ];
-    let section = generate_shared_folders_section(&folders, "virtio-9p-pci");
+    let section = generate_shared_folders_section(&folders, "virtio-9p-pci", None);
     let parsed = parse_shared_folders_section(&section);
     assert_eq!(parsed.len(), 2);
     assert_eq!(parsed[0].host_path, "/home/user/Documents");
@@ -616,8 +625,9 @@ fn test_shared_folders_array_survives_shell_expansion() {
     let folders = vec![SharedFolder {
         host_path: "/home/user/O'Brien Documents".to_string(),
         mount_tag: "host_obrien_documents".to_string(),
+        mode: ShareMode::NineP,
     }];
-    let section = generate_shared_folders_section(&folders, "virtio-9p-pci");
+    let section = generate_shared_folders_section(&folders, "virtio-9p-pci", None);
     let script = format!(
         "{}\nset -- qemu-system-x86_64 {}\nprintf '%s\\0' \"$@\"\n",
         section, SHARED_FOLDERS_ARGS_REF
@@ -1179,4 +1189,202 @@ fn launch_rotates_previous_log() {
 
     assert!(current.contains("SECOND-RUN") && !current.contains("FIRST-RUN"));
     assert!(previous.contains("FIRST-RUN") && !previous.contains("SECOND-RUN"));
+}
+
+// --- SMB-mode shared folders (#101) ---------------------------------------
+
+#[test]
+fn test_generate_shared_folders_section_smb_uses_set_on_user_netdev() {
+    let folders = vec![SharedFolder::smb("/home/user/Public")];
+    let section = generate_shared_folders_section(&folders, "virtio-9p-pci", Some("net0"));
+    assert!(section.contains("    -set\n    'netdev.net0.smb=/home/user/Public'\n"));
+    assert!(!section.contains("-fsdev"));
+    assert!(!section.contains("-device"));
+}
+
+#[test]
+fn test_generate_shared_folders_section_smb_path_with_spaces_and_commas() {
+    // `-set` values are not comma-parsed by QEMU, so the path only needs
+    // shell quoting — commas must survive verbatim.
+    let folders = vec![SharedFolder::smb("/home/user/Docs, Pics & More")];
+    let section = generate_shared_folders_section(&folders, "virtio-9p-pci", Some("net1"));
+    assert!(section.contains("'netdev.net1.smb=/home/user/Docs, Pics & More'"));
+}
+
+#[test]
+fn test_generate_shared_folders_section_mixed_modes_keep_fsdev_indices() {
+    let folders = vec![
+        SharedFolder::nine_p("/srv/a", "host_a"),
+        SharedFolder::smb("/srv/smb"),
+        SharedFolder::nine_p("/srv/b", "host_b"),
+    ];
+    let section = generate_shared_folders_section(&folders, "virtio-9p-pci", Some("net0"));
+    assert!(section.contains("id=fsdev0,path=/srv/a"));
+    assert!(section.contains("netdev.net0.smb=/srv/smb"));
+    // Index follows the folder's position, not the count of 9p folders.
+    assert!(section.contains("id=fsdev2,path=/srv/b"));
+}
+
+#[test]
+fn test_roundtrip_shared_folders_with_smb() {
+    let folders = vec![
+        SharedFolder::nine_p("/home/user/Documents", "host_documents"),
+        SharedFolder::smb("/home/user/My Share"),
+    ];
+    let section = generate_shared_folders_section(&folders, "virtio-9p-pci", Some("net0"));
+    let parsed = parse_shared_folders_section(&section);
+    assert_eq!(parsed.len(), 2);
+    assert_eq!(parsed[0].mode, ShareMode::NineP);
+    assert_eq!(parsed[0].mount_tag, "host_documents");
+    assert_eq!(parsed[1].mode, ShareMode::Smb);
+    assert_eq!(parsed[1].host_path, "/home/user/My Share");
+    // A derived tag so switching the folder back to 9p works without input.
+    assert_eq!(parsed[1].mount_tag, "host_my_share");
+}
+
+#[test]
+fn test_parse_shared_folders_section_ignores_malformed_set() {
+    let content = format!(
+        "{}\nSHARED_FOLDERS_ARGS=(\n    -set\n    netdev.net0.restrict=on\n)\n{}\n",
+        SHARED_FOLDERS_MARKER_START, SHARED_FOLDERS_MARKER_END
+    );
+    assert!(parse_shared_folders_section(&content).is_empty());
+}
+
+#[test]
+fn test_find_user_netdev_id_prefers_default_boot_branch() {
+    let script = r#"#!/bin/bash
+case "$1" in
+    --install)
+        qemu-system-x86_64 \
+        -netdev user,id=inst0 \
+        -device virtio-net-pci,netdev=inst0
+        ;;
+    "")
+        qemu-system-x86_64 \
+        -netdev user,id=net0,hostfwd=tcp::2222-:22 \
+        -device virtio-net-pci,netdev=net0
+        ;;
+esac
+"#;
+    assert_eq!(find_user_netdev_id(script).as_deref(), Some("net0"));
+}
+
+#[test]
+fn test_find_user_netdev_id_none_for_bridge_or_passt() {
+    let bridge = "qemu-system-x86_64 \\\n    -netdev bridge,id=net0,br=vmc-lab \\\n    -device virtio-net-pci,netdev=net0\n";
+    assert_eq!(find_user_netdev_id(bridge), None);
+    let passt = "qemu-system-x86_64 \\\n    -netdev stream,id=net0,server=off,addr.type=unix,addr.path=/tmp/p.sock\n";
+    assert_eq!(find_user_netdev_id(passt), None);
+    let commented = "# -netdev user,id=net0\nqemu-system-x86_64 -m 1024\n";
+    assert_eq!(find_user_netdev_id(commented), None);
+}
+
+#[test]
+fn test_find_user_netdev_id_quoted_spec() {
+    let script = "qemu-system-x86_64 -netdev \"user,id=mynet,hostfwd=tcp::8080-:80\" -device e1000,netdev=mynet\n";
+    assert_eq!(find_user_netdev_id(script).as_deref(), Some("mynet"));
+}
+
+#[test]
+fn test_save_shared_folders_smb_attaches_to_user_netdev() {
+    let dir = tempfile::tempdir().unwrap();
+    let vm = test_vm(dir.path());
+    std::fs::write(
+        &vm.launch_script,
+        "#!/bin/bash\nqemu-system-x86_64 \\\n    -m 2048 \\\n    -netdev user,id=net0 \\\n    -device virtio-net-pci,netdev=net0\n",
+    )
+    .unwrap();
+
+    save_shared_folders(&vm, &[SharedFolder::smb("/home/user/Public")]).unwrap();
+
+    let script = std::fs::read_to_string(&vm.launch_script).unwrap();
+    assert!(script.contains("netdev.net0.smb=/home/user/Public"));
+    // The managed block is expanded at the end of the command, after -netdev,
+    // which is what lets `-set` find the netdev.
+    let netdev_pos = script.find("-netdev user,id=net0").unwrap();
+    let ref_pos = script.find(SHARED_FOLDERS_ARGS_REF).unwrap();
+    assert!(ref_pos > netdev_pos);
+    assert_eq!(
+        load_shared_folders(&vm),
+        vec![SharedFolder::smb("/home/user/Public")]
+    );
+}
+
+#[test]
+fn test_save_shared_folders_smb_rejected_without_user_netdev() {
+    let dir = tempfile::tempdir().unwrap();
+    let vm = test_vm(dir.path());
+    std::fs::write(
+        &vm.launch_script,
+        "#!/bin/bash\nqemu-system-x86_64 \\\n    -netdev bridge,id=net0,br=virbr0 \\\n    -device virtio-net-pci,netdev=net0\n",
+    )
+    .unwrap();
+
+    let err = save_shared_folders(&vm, &[SharedFolder::smb("/srv/share")]).unwrap_err();
+    assert!(err.to_string().contains("user-mode networking"), "{err}");
+    // Nothing written.
+    let script = std::fs::read_to_string(&vm.launch_script).unwrap();
+    assert!(!script.contains(SHARED_FOLDERS_MARKER_START));
+}
+
+#[test]
+fn test_save_shared_folders_rejects_two_smb_folders() {
+    let dir = tempfile::tempdir().unwrap();
+    let vm = test_vm(dir.path());
+    std::fs::write(
+        &vm.launch_script,
+        "#!/bin/bash\nqemu-system-x86_64 -netdev user,id=net0 -device e1000,netdev=net0\n",
+    )
+    .unwrap();
+
+    let err = save_shared_folders(
+        &vm,
+        &[SharedFolder::smb("/srv/a"), SharedFolder::smb("/srv/b")],
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("only one folder"), "{err}");
+}
+
+#[test]
+fn test_smb_shared_folder_survives_shell_expansion() {
+    let folders = vec![SharedFolder::smb("/home/user/O'Brien, Docs")];
+    let section = generate_shared_folders_section(&folders, "virtio-9p-pci", Some("net0"));
+    let script = format!(
+        "{}\nset -- qemu-system-x86_64 {}\nprintf '%s\\0' \"$@\"\n",
+        section, SHARED_FOLDERS_ARGS_REF
+    );
+    let output = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(script)
+        .output()
+        .expect("bash should run");
+    assert!(output.status.success());
+    let args: Vec<String> = output
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).to_string())
+        .collect();
+    assert_eq!(
+        args,
+        vec![
+            "qemu-system-x86_64".to_string(),
+            "-set".to_string(),
+            "netdev.net0.smb=/home/user/O'Brien, Docs".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn test_generate_mount_tag() {
+    assert_eq!(
+        generate_mount_tag("/home/user/My Documents"),
+        "host_my_documents"
+    );
+    assert_eq!(
+        generate_mount_tag("/srv/Share-2024.v1"),
+        "host_share_2024_v1"
+    );
+    assert_eq!(generate_mount_tag("/"), "host_shared");
 }

@@ -1235,11 +1235,168 @@ const SHARED_FOLDERS_MARKER_START: &str = "# >>> Shared Folders (managed by vm-c
 const SHARED_FOLDERS_MARKER_END: &str = "# <<< Shared Folders <<<";
 const SHARED_FOLDERS_ARGS_REF: &str = "\"${SHARED_FOLDERS_ARGS[@]}\"";
 
-/// A shared folder configuration for virtio-9p host-to-guest file sharing
+/// How a shared folder is exposed to the guest.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ShareMode {
+    /// virtio-9p filesystem device, mounted in the guest by `mount_tag`.
+    #[default]
+    NineP,
+    /// QEMU's built-in SMB server on the user-mode (SLIRP) netdev. The guest
+    /// reaches it at `\\10.0.2.4\qemu` with no driver install (#101). Needs
+    /// `smbd` (samba) on the host and a `user` network backend; QEMU exports
+    /// a single directory per netdev, so at most one folder may use this mode.
+    Smb,
+}
+
+/// UNC path at which the guest sees an SMB-mode shared folder (SLIRP's default
+/// SMB server address and QEMU's fixed share name).
+pub const SMB_GUEST_SHARE: &str = "\\\\10.0.2.4\\qemu";
+
+/// A shared folder configuration for host-to-guest file sharing
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SharedFolder {
     pub host_path: String,
+    /// 9p mount tag. Kept for SMB-mode folders too so switching modes is lossless.
     pub mount_tag: String,
+    pub mode: ShareMode,
+}
+
+impl SharedFolder {
+    /// A virtio-9p folder with an explicit mount tag.
+    pub fn nine_p(host_path: impl Into<String>, mount_tag: impl Into<String>) -> Self {
+        Self {
+            host_path: host_path.into(),
+            mount_tag: mount_tag.into(),
+            mode: ShareMode::NineP,
+        }
+    }
+
+    /// An SMB folder; the mount tag is derived from the path in case the user
+    /// later switches it to 9p.
+    pub fn smb(host_path: impl Into<String>) -> Self {
+        let host_path = host_path.into();
+        let mount_tag = generate_mount_tag(&host_path);
+        Self {
+            host_path,
+            mount_tag,
+            mode: ShareMode::Smb,
+        }
+    }
+}
+
+/// Generate a 9p mount tag from a host directory path (`/home/u/My Docs` → `host_my_docs`).
+pub fn generate_mount_tag(path: &str) -> String {
+    let folder_name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("shared");
+    let sanitized: String = folder_name
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .collect();
+    let tag = sanitized
+        .split('_')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("_");
+    format!(
+        "host_{}",
+        if tag.is_empty() {
+            "shared".to_string()
+        } else {
+            tag
+        }
+    )
+}
+
+/// Find the id of the user-mode (SLIRP) netdev in a launch script, e.g. `net0`
+/// from `-netdev user,id=net0,hostfwd=...`. Looks at the last QEMU invocation
+/// (the default boot branch in vm-curator's generated scripts) first, then the
+/// whole script, so a `--install` branch with a different setup can't mislead it.
+pub fn find_user_netdev_id(content: &str) -> Option<String> {
+    fn scan(text: &str) -> Option<String> {
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('#') {
+                continue;
+            }
+            let Some(pos) = trimmed.find("-netdev") else {
+                continue;
+            };
+            let after = trimmed[pos + "-netdev".len()..].trim_start();
+            // The netdev spec is the next shell word; it may be quoted.
+            let spec = after
+                .trim_start_matches(['"', '\''])
+                .split(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '\\')
+                .next()
+                .unwrap_or("");
+            if !(spec.starts_with("user,") || spec == "user" || spec.starts_with("user ")) {
+                continue;
+            }
+            for opt in spec.split(',') {
+                if let Some(id) = opt.strip_prefix("id=") {
+                    if !id.is_empty() {
+                        return Some(id.to_string());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    // Prefer the default boot branch: the last qemu-system-* block.
+    let lines: Vec<&str> = content.lines().collect();
+    let mut last_start = None;
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim_start();
+        if !t.starts_with('#')
+            && (t.starts_with("qemu-system-") || t.starts_with("exec qemu-system-"))
+        {
+            last_start = Some(i);
+        }
+    }
+    if let Some(start) = last_start {
+        let mut end = start;
+        while end + 1 < lines.len() && lines[end].trim_end().ends_with('\\') {
+            end += 1;
+        }
+        if let Some(id) = scan(&lines[start..=end].join("\n")) {
+            return Some(id);
+        }
+    }
+    scan(content)
+}
+
+/// Where QEMU expects the host `smbd` binary for its built-in SMB server.
+/// Distro builds compile in `/usr/sbin/smbd`; fall back to a PATH lookup.
+pub fn smbd_available() -> bool {
+    if std::path::Path::new("/usr/sbin/smbd").exists() {
+        return true;
+    }
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join("smbd").is_file()))
+        .unwrap_or(false)
+}
+
+/// Validate an SMB-mode folder set against the launch script before saving.
+/// Returns the user netdev id to attach the share to.
+fn validate_smb_folders(folders: &[SharedFolder], content: &str) -> Result<Option<String>> {
+    let smb_count = folders.iter().filter(|f| f.mode == ShareMode::Smb).count();
+    if smb_count == 0 {
+        return Ok(None);
+    }
+    if smb_count > 1 {
+        anyhow::bail!(
+            "QEMU's built-in SMB server exports a single directory; only one folder can use SMB mode (share a parent directory instead)"
+        );
+    }
+    match find_user_netdev_id(content) {
+        Some(id) => Ok(Some(id)),
+        None => anyhow::bail!(
+            "SMB shares need user-mode networking (the `user` backend); this VM's launch.sh has no `-netdev user` — change it in Network Settings or use 9p mode"
+        ),
+    }
 }
 
 /// Escape a string for safe use in shell scripts
@@ -1261,6 +1418,9 @@ pub fn save_shared_folders(vm: &DiscoveredVm, folders: &[SharedFolder]) -> Resul
     // Remove existing shared folders section if present
     let content = remove_shared_folders_section(&content);
 
+    // SMB folders piggyback on the user-mode netdev; make sure there is one.
+    let smb_netdev = validate_smb_folders(folders, &content)?;
+
     // Determine device name based on architecture
     let device_name = if vm.config.emulator.command().contains("aarch64")
         || vm.config.emulator.command().contains("arm")
@@ -1271,7 +1431,7 @@ pub fn save_shared_folders(vm: &DiscoveredVm, folders: &[SharedFolder]) -> Resul
     };
 
     // Generate new shared folders section
-    let section = generate_shared_folders_section(folders, device_name);
+    let section = generate_shared_folders_section(folders, device_name, smb_netdev.as_deref());
 
     // Insert into script
     let new_content = insert_shared_folders_section(&content, &section);
@@ -1336,7 +1496,19 @@ fn remove_shared_folders_arg_ref(line: &str) -> String {
     cleaned
 }
 
-fn generate_shared_folders_section(folders: &[SharedFolder], device_name: &str) -> String {
+/// Build the managed `SHARED_FOLDERS_ARGS` block.
+///
+/// 9p folders become `-fsdev`/`-device` pairs. An SMB folder becomes
+/// `-set netdev.<id>.smb=<path>`, which QEMU applies to the already-defined
+/// user netdev (`-set` runs after all `-netdev` options on the command line,
+/// which is where this block is expanded). Keeping it here rather than on the
+/// `-netdev` line itself means the network generator/parser stay untouched,
+/// and commas in the path need no escaping (unlike inline `smb=`).
+fn generate_shared_folders_section(
+    folders: &[SharedFolder],
+    device_name: &str,
+    smb_netdev: Option<&str>,
+) -> String {
     if folders.is_empty() {
         return String::new();
     }
@@ -1347,6 +1519,16 @@ fn generate_shared_folders_section(folders: &[SharedFolder], device_name: &str) 
     section.push_str("SHARED_FOLDERS_ARGS=(\n");
 
     for (i, folder) in folders.iter().enumerate() {
+        if folder.mode == ShareMode::Smb {
+            let netdev = smb_netdev.unwrap_or("net0");
+            let set_arg = format!("netdev.{}.smb={}", netdev, folder.host_path);
+            section.push_str("    -set\n");
+            section.push_str("    ");
+            section.push_str(&shell_escape(&set_arg));
+            section.push('\n');
+            continue;
+        }
+
         let id = format!("fsdev{}", i);
         let fsdev_arg = format!(
             "local,id={},path={},security_model=mapped-xattr",
@@ -1507,10 +1689,7 @@ fn parse_shared_folders_legacy_line(line: &str) -> Vec<SharedFolder> {
         let mount_tag = extract_simple_value(part, "mount_tag=");
 
         if let (Some(path), Some(tag)) = (host_path, mount_tag) {
-            folders.push(SharedFolder {
-                host_path: path,
-                mount_tag: tag,
-            });
+            folders.push(SharedFolder::nine_p(path, tag));
         }
     }
 
@@ -1530,6 +1709,15 @@ fn parse_shared_folder_tokens(tokens: &[String]) -> Vec<SharedFolder> {
     let mut i = 0;
 
     while i < tokens.len() {
+        // SMB-mode folder: `-set netdev.<id>.smb=<path>`
+        if tokens[i] == "-set" {
+            if let Some(path) = tokens.get(i + 1).and_then(|arg| parse_smb_set_arg(arg)) {
+                folders.push(SharedFolder::smb(path));
+            }
+            i += 2;
+            continue;
+        }
+
         if tokens[i] != "-fsdev" {
             i += 1;
             continue;
@@ -1553,16 +1741,24 @@ fn parse_shared_folder_tokens(tokens: &[String]) -> Vec<SharedFolder> {
         }
 
         if let (Some(path), Some(tag)) = (extract_path_value(fsdev_arg), mount_tag) {
-            folders.push(SharedFolder {
-                host_path: path,
-                mount_tag: tag,
-            });
+            folders.push(SharedFolder::nine_p(path, tag));
         }
 
         i += 2;
     }
 
     folders
+}
+
+/// Extract the shared path from a `netdev.<id>.smb=<path>` `-set` argument.
+fn parse_smb_set_arg(arg: &str) -> Option<String> {
+    let rest = arg.strip_prefix("netdev.")?;
+    let (_, value) = rest.split_once(".smb=")?;
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
 }
 
 fn parse_shell_words(line: &str) -> Vec<String> {
