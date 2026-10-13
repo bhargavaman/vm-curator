@@ -265,3 +265,44 @@ fn test_physical_device_path_not_resolved_relative() {
         PathBuf::from("/dev/nvme0n1")
     );
 }
+
+#[test]
+fn test_disks_scoped_to_default_boot_branch() {
+    // vm-curator-generated scripts wrap several qemu-system invocations (one
+    // per boot mode) in a `case "$1" in ... esac`, with the default no-args
+    // boot branch emitted last. Disk extraction must only look at that final
+    // invocation, not merge drives from --cdrom/--floppy branches that
+    // reference positional parameters like "$2".
+    let vm_dir = Path::new("/home/user/vms/openwrt");
+    let script_path = vm_dir.join("launch.sh");
+    let content = r#"#!/bin/bash
+VM_DIR="$(dirname "$(readlink -f "$0")")"
+DISK="$VM_DIR/openwrt.raw"
+OVMF_VARS="$VM_DIR/OVMF_VARS.fd"
+
+case "$1" in
+    --cdrom)
+        qemu-system-x86_64 \
+        -drive if=pflash,format=raw,file="$OVMF_VARS" \
+        -drive file="$DISK",format=raw,if=virtio,index=0,media=disk \
+        -drive file="$2",media=cdrom,index=1
+        ;;
+    "")
+        qemu-system-x86_64 \
+        -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/x64/OVMF_CODE.4m.fd \
+        -drive if=pflash,format=raw,file="$OVMF_VARS" \
+        -drive file="$DISK",format=raw,if=virtio,index=0,media=disk
+        ;;
+esac
+"#;
+    let config = parse_launch_script(&script_path, content).unwrap();
+
+    assert_eq!(config.disks.len(), 3);
+    let paths: Vec<String> = config
+        .disks
+        .iter()
+        .map(|d| d.path.to_string_lossy().to_string())
+        .collect();
+    assert!(!paths.iter().any(|p| p.contains('$')));
+    assert!(paths.iter().any(|p| p.ends_with("openwrt.raw")));
+}

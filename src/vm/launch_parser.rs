@@ -368,14 +368,74 @@ fn expand_variables(s: &str, vars: &HashMap<String, String>, vm_dir: &Path) -> S
     result
 }
 
+/// Extract the primary `qemu-system-*` invocation from the script, including
+/// its backslash-continuation lines.
+///
+/// vm-curator's own generated launch.sh files wrap several invocations (one
+/// per boot mode: `--install`, `--cdrom`, `--recovery`, `--floppy`, and the
+/// default normal boot) in a `case "$1" in ... esac`. The default/no-args
+/// branch - the configuration vm-curator treats as canonical - is always the
+/// last invocation emitted, right before the catch-all `*)` branch. Scoping
+/// per-invocation parsing (like disks) to that last block, rather than the
+/// whole file, avoids mixing in install/cdrom/recovery drives (e.g. `-drive
+/// file="$2"`) that belong to other branches.
+fn extract_primary_command_block(content: &str) -> &str {
+    let emulators = [
+        "qemu-system-x86_64",
+        "qemu-system-i386",
+        "qemu-system-ppc",
+        "qemu-system-m68k",
+        "qemu-system-arm",
+        "qemu-system-aarch64",
+    ];
+
+    // Byte ranges of each line (newline included) so the block can be sliced
+    // back out of `content` without reconstructing the text.
+    let mut lines = Vec::new();
+    let mut offset = 0usize;
+    for line in content.split_inclusive('\n') {
+        lines.push((offset, offset + line.len()));
+        offset += line.len();
+    }
+
+    let mut start_idx = None;
+    for (i, &(s, e)) in lines.iter().enumerate() {
+        let trimmed = content[s..e].trim_start();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        if emulators.iter().any(|em| trimmed.starts_with(em)) {
+            start_idx = Some(i);
+        }
+    }
+
+    let Some(start_idx) = start_idx else {
+        return content;
+    };
+
+    let mut end_idx = start_idx;
+    while content[lines[end_idx].0..lines[end_idx].1]
+        .trim_end()
+        .ends_with('\\')
+        && end_idx + 1 < lines.len()
+    {
+        end_idx += 1;
+    }
+
+    &content[lines[start_idx].0..lines[end_idx].1]
+}
+
 /// Extract disk configurations
 fn extract_disks(content: &str, vm_dir: &Path) -> Vec<DiskConfig> {
     let mut disks = Vec::new();
 
-    // First, parse all variable assignments
+    // Parse variable assignments from the whole script - DISK/ISO/etc. are
+    // typically assigned once near the top, outside any invocation block.
     let vars = extract_shell_variables(content, vm_dir);
 
-    for line in content.lines() {
+    let block = extract_primary_command_block(content);
+
+    for line in block.lines() {
         if line.trim_start().starts_with('#') {
             continue;
         }
