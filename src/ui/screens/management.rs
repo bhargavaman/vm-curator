@@ -68,7 +68,7 @@ pub fn get_menu_items(vm: &DiscoveredVm, config: &Config) -> Vec<MenuItem> {
         },
         MenuItem {
             name: "Shared Folders",
-            description: "Share host directories with the VM (9p)",
+            description: "Share host directories with the VM (9p or SMB)",
             action: MenuAction::SharedFolders,
         },
         MenuItem {
