@@ -69,6 +69,26 @@ pub fn get_supported_displays(emulator: &str) -> Vec<String> {
     parse_display_help(&text)
 }
 
+/// Human-readable hint when QEMU was installed without any GUI display
+/// backend (only `vnc`/`none`/`curses`/`dbus`-style outputs), which is what a
+/// minimal distro package such as Fedora's `qemu-system-x86-core` gives you
+/// (#98). `None` when a GUI backend is present or when nothing was detected
+/// at all (the emulator is missing, which is a different problem).
+pub fn missing_gui_backend_hint(detected: &[String]) -> Option<&'static str> {
+    if detected.is_empty() {
+        return None;
+    }
+    const GUI_BACKENDS: [&str; 4] = ["gtk", "sdl", "spice-app", "cocoa"];
+    if detected.iter().any(|d| GUI_BACKENDS.contains(&d.as_str())) {
+        return None;
+    }
+    Some(
+        "This QEMU has no windowed display backend (only headless outputs). \
+         Install the full QEMU: Fedora/RHEL `qemu-system-x86` (not -core), \
+         Debian/Ubuntu `qemu-system-gui`, Arch `qemu-desktop`.",
+    )
+}
+
 /// Parse the output of `<emulator> -display help`.
 ///
 /// QEMU prints a header line ending in ":", a list of backend names (one per
@@ -324,5 +344,36 @@ For a short list of the suboptions for each display, see the top-level -help out
         assert!(!is_valid_display_backend("-display"));
         assert!(!is_valid_display_backend("display backend,option"));
         assert!(!is_valid_display_backend(""));
+    }
+}
+
+#[cfg(test)]
+mod gui_backend_hint_tests {
+    use super::missing_gui_backend_hint;
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn no_hint_when_a_gui_backend_exists() {
+        assert!(missing_gui_backend_hint(&v(&["gtk", "vnc", "none"])).is_none());
+        assert!(missing_gui_backend_hint(&v(&["vnc", "sdl"])).is_none());
+        assert!(missing_gui_backend_hint(&v(&["spice-app", "none"])).is_none());
+    }
+
+    #[test]
+    fn hint_for_headless_only_qemu() {
+        // What Fedora's qemu-system-x86-core reports (#98).
+        let hint = missing_gui_backend_hint(&v(&["vnc", "none", "curses", "dbus", "egl-headless"]))
+            .expect("headless-only QEMU should produce a hint");
+        assert!(hint.contains("qemu-system-x86"));
+        assert!(hint.contains("qemu-system-gui"));
+    }
+
+    #[test]
+    fn no_hint_when_nothing_detected() {
+        // Probe failed (emulator missing); that's reported elsewhere.
+        assert!(missing_gui_backend_hint(&[]).is_none());
     }
 }

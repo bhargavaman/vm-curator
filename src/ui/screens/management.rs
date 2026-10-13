@@ -434,15 +434,33 @@ pub fn render_display_options(app: &App, frame: &mut Frame) {
         ])
         .split(inner);
 
+    // A headless-only QEMU (e.g. Fedora's qemu-system-x86-core) offers no
+    // gtk/sdl/spice-app; say which package fixes that instead of silently
+    // listing just vnc/none (#98).
+    let gui_hint = app
+        .selected_vm()
+        .map(|vm| vm.config.emulator.command())
+        .and_then(|emulator| app.display_capabilities.get(emulator))
+        .and_then(|detected| crate::commands::qemu_system::missing_gui_backend_hint(detected));
+    let hint_rows = if gui_hint.is_some() { 4 } else { 0 };
+
     // Add top padding and help area
     let v_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // Top padding
-            Constraint::Min(1),    // Content
-            Constraint::Length(2), // Help
+            Constraint::Length(1),         // Top padding
+            Constraint::Min(1),            // Content
+            Constraint::Length(hint_rows), // Missing-GUI-backend hint
+            Constraint::Length(2),         // Help
         ])
         .split(h_chunks[1]);
+
+    if let Some(hint) = gui_hint {
+        let note = Paragraph::new(hint)
+            .style(Style::default().fg(Color::Yellow))
+            .wrap(Wrap { trim: true });
+        frame.render_widget(note, v_chunks[2]);
+    }
 
     let display_options = get_display_options(app);
 
@@ -483,7 +501,7 @@ pub fn render_display_options(app: &App, frame: &mut Frame) {
     let help = Paragraph::new("[Enter] Select  [Esc] Back")
         .style(Style::default().fg(Color::DarkGray))
         .alignment(Alignment::Center);
-    frame.render_widget(help, v_chunks[2]);
+    frame.render_widget(help, v_chunks[3]);
 }
 
 /// Extract display setting from launch script

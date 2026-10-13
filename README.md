@@ -18,6 +18,7 @@ A fast and friendly Rust TUI for managing desktop QEMU/KVM virtual machines — 
 - **SMB Shared Folders for Windows Guests** (thanks @ahmutkadim, #101): Press `m` on a shared folder to switch it to QEMU's built-in SMB server — the guest opens `\\10.0.2.4\qemu` with no driver install (Windows-profile VMs default to it); needs the `samba` package on the host and user-mode networking
 - **Fix Create/Edit Network Form Hiding How to Save** (thanks @sae-lco, #100): The form gains a `[ Save ] [ Cancel ]` button row (Enter activates), and its help text wraps and stays visible on narrow or short terminals instead of clipping off the `[s] Save` hint
 - **Document How to Swap Floppies/CDs During an Install** (thanks @Revali25, #99): The Boot Options screen and the README now explain QEMU's monitor tab (`View → compatmonitor0`, then `change floppy0 <img>`) for multi-disk installs
+- **Fix RPM Installing a Headless QEMU** (thanks @Revali25, #98): The RPM now depends on `qemu-system-x86` (not `-core`) so Fedora gets the display and audio modules; both packages declare the optional tools as weak dependencies, and the Change Display screen names the package to install when QEMU has no windowed backend
 
 **v1.4.0**
 - **Physical Disk Passthrough as Boot Device** (#80): Pass whole NVMe/SATA/USB disks straight through to guests — a new **Physical Disk** mode in the creation wizard (with a safety-filtered picker that excludes the host system disk, mounted disks, and LVM/swap members) and a **Passthrough Disks** management screen for existing VMs, with per-disk boot index; USB passthrough gains a boot-index option too. Also fixes a latent bug where Fedora's qcow2 OVMF firmware could be mistaken for the VM's disk — letting Reset VM delete it
@@ -457,7 +458,11 @@ facts = ["Fact 1", "Fact 2"]
 
 ### Dependencies
 
-- **Runtime**: QEMU, qemu-img, libudev
+- **Runtime**: QEMU with a windowed display backend, qemu-img, libudev. Distro packages split QEMU, so make sure you have the full one:
+  - Fedora/RHEL: `sudo dnf install qemu-system-x86 qemu-img edk2-ovmf swtpm` — `qemu-system-x86` (not `-core`) is what pulls in the GTK/SDL/SPICE display and audio modules; the RPM package depends on it
+  - Debian/Ubuntu: `sudo apt install qemu-system-x86 qemu-system-gui qemu-utils ovmf swtpm` — `qemu-system-gui` holds the display and audio backends and is only *recommended* by `qemu-system-x86`
+  - Arch: `sudo pacman -S qemu-desktop edk2-ovmf swtpm`
+  - If the Change Display screen offers only `vnc`/`none`, that's the sign QEMU was installed without its GUI modules
 - **Build**: a recent Rust stable toolchain (see `rust-toolchain.toml`), libudev-dev (Debian/Ubuntu) or systemd-libs (Arch)
 - **Optional**: OVMF/edk2 (UEFI), swtpm (Windows 11 TPM), virt-viewer (SPICE-app), passt (networking), dnsmasq + nftables/iptables (managed virtual networks), Looking Glass client (multi-GPU), polkit (bridge networking)
 
