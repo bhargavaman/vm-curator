@@ -566,8 +566,11 @@ pub struct VNetEditorState {
     pub kind: crate::vnet::VNetKind,
     pub subnet: String,
     pub dhcp: bool,
-    /// 0 = name, 1 = type, 2 = subnet, 3 = DHCP toggle
+    /// Focused row: see the `FIELD_*` constants (name, type, subnet, DHCP,
+    /// and the `[ Save ] [ Cancel ]` button row).
     pub field_focus: usize,
+    /// On the button row: false = Save highlighted, true = Cancel (#100).
+    pub action_cancel: bool,
     /// True while a text field is being edited
     pub editing: bool,
     pub edit_buffer: String,
@@ -575,6 +578,14 @@ pub struct VNetEditorState {
 }
 
 impl VNetEditorState {
+    pub const FIELD_NAME: usize = 0;
+    pub const FIELD_TYPE: usize = 1;
+    pub const FIELD_SUBNET: usize = 2;
+    pub const FIELD_DHCP: usize = 3;
+    /// The `[ Save ] [ Cancel ]` row — a visible way to finish the form (#100).
+    pub const FIELD_ACTIONS: usize = 4;
+    pub const FIELD_COUNT: usize = 5;
+
     pub fn new_network() -> Self {
         Self {
             original_name: None,
@@ -582,7 +593,8 @@ impl VNetEditorState {
             kind: crate::vnet::VNetKind::Nat,
             subnet: "192.168.150.0/24".to_string(),
             dhcp: true,
-            field_focus: 0,
+            field_focus: Self::FIELD_NAME,
+            action_cancel: false,
             editing: false,
             edit_buffer: String::new(),
             error: None,
@@ -596,7 +608,8 @@ impl VNetEditorState {
             kind: net.kind,
             subnet: net.subnet.clone(),
             dhcp: net.dhcp,
-            field_focus: 1,
+            field_focus: Self::FIELD_TYPE,
+            action_cancel: false,
             editing: false,
             edit_buffer: String::new(),
             error: None,
