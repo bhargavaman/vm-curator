@@ -32,6 +32,7 @@ pub enum MenuAction {
     Toggle3dAccel,
     EditNotes,
     RenameVm,
+    ResizeStorage,
     ResetVm,
     DeleteVm,
     EditRawConfig,
@@ -122,6 +123,11 @@ pub fn get_menu_items(vm: &DiscoveredVm, config: &Config) -> Vec<MenuItem> {
             description: "Change the VM's display name",
             action: MenuAction::RenameVm,
         },
+        MenuItem {
+            name: "Resize Storage",
+            description: "Increase a virtual disk capacity",
+            action: MenuAction::ResizeStorage,
+        },
     ]);
 
     items.push(MenuItem {
@@ -162,6 +168,14 @@ pub fn menu_item_count(app: &App) -> usize {
         get_menu_items(vm, &app.config).len()
     } else {
         6 // Default count
+    }
+}
+
+fn menu_item_label(index: usize, name: &str) -> String {
+    if index < 9 {
+        format!("[{}] {}", index + 1, name)
+    } else {
+        format!("    {name}")
     }
 }
 
@@ -268,7 +282,7 @@ pub fn render(app: &App, frame: &mut Frame) {
             };
 
             let content = vec![
-                Line::styled(format!("[{}] {}", i + 1, item.name), style),
+                Line::styled(menu_item_label(i, item.name), style),
                 Line::styled(
                     format!("    {}", item.description),
                     Style::default().fg(Color::DarkGray),
@@ -602,4 +616,59 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     Rect::new(x, y, width, height)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vm::QemuConfig;
+    use std::path::PathBuf;
+
+    fn test_vm() -> DiscoveredVm {
+        DiscoveredVm {
+            id: "test-vm".to_string(),
+            path: PathBuf::from("/vms/test-vm"),
+            launch_script: PathBuf::from("/vms/test-vm/launch.sh"),
+            config: QemuConfig::default(),
+            custom_name: None,
+            os_profile: None,
+            notes: None,
+        }
+    }
+
+    #[test]
+    fn management_menu_exposes_storage_resize() {
+        let items = get_menu_items(&test_vm(), &Config::default());
+        let resize = items
+            .iter()
+            .find(|item| item.action == MenuAction::ResizeStorage)
+            .expect("resize storage menu item");
+
+        assert_eq!(resize.name, "Resize Storage");
+        assert_eq!(resize.description, "Increase a virtual disk capacity");
+    }
+
+    #[test]
+    fn menu_labels_only_advertise_supported_numeric_shortcuts() {
+        assert_eq!(menu_item_label(0, "First"), "[1] First");
+        assert_eq!(menu_item_label(8, "Ninth"), "[9] Ninth");
+        assert_eq!(menu_item_label(9, "Tenth"), "    Tenth");
+        assert_eq!(menu_item_label(13, "Fourteenth"), "    Fourteenth");
+    }
+
+    #[test]
+    fn storage_resize_does_not_advertise_an_unhandled_shortcut() {
+        let items = get_menu_items(&test_vm(), &Config::default());
+        let (index, resize) = items
+            .iter()
+            .enumerate()
+            .find(|(_, item)| item.action == MenuAction::ResizeStorage)
+            .expect("resize storage menu item");
+
+        assert!(
+            index >= 9,
+            "test requires resize to appear after shortcut 9"
+        );
+        assert_eq!(menu_item_label(index, resize.name), "    Resize Storage");
+    }
 }

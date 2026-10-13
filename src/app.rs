@@ -71,6 +71,12 @@ pub enum Screen {
     FileBrowser,
     /// Text input dialog
     TextInput(TextInputContext),
+    /// Select which virtual system disk to resize
+    ResizeDiskPicker {
+        vm_id: String,
+        disk_paths: Vec<PathBuf>,
+        selected: usize,
+    },
     /// Error dialog (scrollable)
     ErrorDialog,
     /// VM Creation wizard (step tracked in wizard_state)
@@ -101,6 +107,11 @@ pub enum Screen {
 pub enum TextInputContext {
     SnapshotName,
     RenameVm,
+    ResizeVmDisk {
+        vm_id: String,
+        disk_path: PathBuf,
+        current_size_bytes: u64,
+    },
 }
 
 /// Actions that need confirmation

@@ -10,6 +10,7 @@ pub mod network_manager;
 pub mod network_settings;
 pub mod pci_passthrough;
 pub mod physical_disk_picker;
+pub mod resize_disk_picker;
 pub mod settings;
 pub mod shared_folders;
 pub mod single_gpu_setup;
