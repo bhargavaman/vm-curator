@@ -1388,3 +1388,119 @@ fn test_generate_mount_tag() {
     );
     assert_eq!(generate_mount_tag("/"), "host_shared");
 }
+
+// --- `-name "$VM_NAME"` self-heal for older scripts (#96) ---------------
+
+const OLD_SCRIPT_NO_NAME: &str = r#"#!/bin/bash
+# Old VM Launch Script
+VM_DIR="$(dirname "$(readlink -f "$0")")"
+DISK="$VM_DIR/disk.qcow2"
+
+case "$1" in
+    --install)
+        qemu-system-x86_64 \
+        -enable-kvm \
+        -m 2048M \
+        -cdrom "$ISO"
+        ;;
+    "")
+        echo "Booting..."
+        qemu-system-x86_64 \
+        -enable-kvm \
+        -m 2048M
+        ;;
+esac
+"#;
+
+#[test]
+fn test_add_vm_name_patches_every_qemu_block() {
+    let patched = add_vm_name_to_script(OLD_SCRIPT_NO_NAME).expect("should patch");
+    // VM_NAME defined right after VM_DIR
+    assert!(patched.contains(
+        "VM_DIR=\"$(dirname \"$(readlink -f \"$0\")\")\"\nVM_NAME=\"$(basename \"$VM_DIR\")\"\n"
+    ));
+    // -name inserted as the first arg of both invocations, indentation kept
+    assert_eq!(
+        patched.matches("        -name \"$VM_NAME\" \\\n").count(),
+        2
+    );
+    assert!(patched.contains(
+        "        qemu-system-x86_64 \\\n        -name \"$VM_NAME\" \\\n        -enable-kvm \\\n"
+    ));
+    // Nothing else changed
+    assert!(patched.contains("        -cdrom \"$ISO\"\n        ;;"));
+}
+
+#[test]
+fn test_add_vm_name_is_idempotent_and_respects_existing_name() {
+    let patched = add_vm_name_to_script(OLD_SCRIPT_NO_NAME).unwrap();
+    assert!(
+        add_vm_name_to_script(&patched).is_none(),
+        "second pass is a no-op"
+    );
+
+    let user_named =
+        OLD_SCRIPT_NO_NAME.replace("-enable-kvm \\\n", "-name \"My Box\" \\\n-enable-kvm \\\n");
+    assert!(
+        add_vm_name_to_script(&user_named).is_none(),
+        "user's own -name is kept"
+    );
+}
+
+#[test]
+fn test_add_vm_name_skips_scripts_it_cannot_anchor() {
+    // No VM_DIR line to hang VM_NAME on: leave it alone rather than emit an
+    // unbound variable.
+    let hand_written = "#!/bin/bash\nqemu-system-x86_64 \\\n    -m 1024M\n";
+    assert!(add_vm_name_to_script(hand_written).is_none());
+    // Single-line invocation (no continuation): nothing to splice into.
+    let one_liner = "#!/bin/bash\nVM_DIR=\"$(dirname \"$0\")\"\nqemu-system-x86_64 -m 1024M\n";
+    assert!(add_vm_name_to_script(one_liner).is_none());
+    // A commented-out -name doesn't count as present.
+    let commented = OLD_SCRIPT_NO_NAME.replace("# Old VM Launch Script", "# -name \"x\" was here");
+    assert!(add_vm_name_to_script(&commented).is_some());
+}
+
+#[test]
+fn test_add_vm_name_result_is_valid_bash_and_expands_to_dir_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let vm_dir = dir.path().join("tiny11pro");
+    std::fs::create_dir(&vm_dir).unwrap();
+    let script_path = vm_dir.join("launch.sh");
+    // Patch first, then swap the qemu invocations for a printf so we can
+    // observe the args the script would pass.
+    let patched = add_vm_name_to_script(OLD_SCRIPT_NO_NAME).unwrap();
+    let observable = patched.replace("qemu-system-x86_64 \\", "printf '%s\\n' \\");
+    std::fs::write(&script_path, observable).unwrap();
+
+    let syntax = std::process::Command::new("bash")
+        .args(["-n", script_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        syntax.status.success(),
+        "{}",
+        String::from_utf8_lossy(&syntax.stderr)
+    );
+
+    let run = std::process::Command::new("bash")
+        .arg(&script_path)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("-name\ntiny11pro\n"), "stdout: {stdout}");
+}
+
+#[test]
+fn test_ensure_name_in_script_writes_file() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("launch.sh"), OLD_SCRIPT_NO_NAME).unwrap();
+    ensure_name_in_script(dir.path()).unwrap();
+    let after = std::fs::read_to_string(dir.path().join("launch.sh")).unwrap();
+    assert!(after.contains("-name \"$VM_NAME\""));
+    ensure_name_in_script(dir.path()).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("launch.sh")).unwrap(),
+        after
+    );
+}
