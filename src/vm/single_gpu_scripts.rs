@@ -588,7 +588,17 @@ trap cleanup EXIT INT TERM
 
 echo "Stopping display manager ($DISPLAY_MANAGER)..."
 systemctl stop "$DISPLAY_MANAGER"
-sleep 2
+
+# Wait until the service actually stops — logind needs time to tear down the
+# greeter session and release its DRM devices; a fixed sleep is often not
+# enough on GNOME/Wayland (issue #64).
+for _ in $(seq 1 15); do
+    if ! systemctl is-active --quiet "$DISPLAY_MANAGER"; then
+        break
+    fi
+    sleep 1
+done
+sleep 1
 
 # For NVIDIA, stop persistence daemon
 if [[ "$ORIGINAL_DRIVER" == "nvidia" ]]; then
@@ -600,14 +610,53 @@ fi
 # Unload GPU Driver
 # ============================================================================
 
-echo "Unloading GPU driver modules..."
+echo "Stopping processes using the GPU..."
 
-# Kill any processes using the GPU (try common ones)
-# (pkill matches the process name case-sensitively: it is `Hyprland`, not `hyprland`.)
+# The display manager is stopped, but its X/Wayland server can outlive the
+# unit by a few seconds (SDDM's Xorg still holds /dev/nvidia* after
+# `systemctl stop sddm` reports done, issue #92). Give it a moment to exit
+# on its own before killing — a clean exit releases the GPU faster than
+# SIGKILL followed by the kernel tearing down its fds.
+# (pgrep/pkill match the process name case-sensitively: it is `Hyprland`.)
+display_procs='Xorg|Xwayland|gnome-shell|kwin_wayland|plasmashell|sway|Hyprland|niri'
+for _ in $(seq 1 10); do
+    if ! pgrep -x "$display_procs" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+
+# Kill well-known compositors still around...
 for proc in Xorg Xwayland gnome-shell kwin_wayland plasmashell sway Hyprland niri; do
-    pkill -9 "$proc" 2>/dev/null || true
+    pkill -9 -x "$proc" 2>/dev/null || true
 done
 sleep 2
+
+# ...then sweep anything still holding a GPU device node — greeter workers,
+# pipewire/wireplumber, lingering Xwayland, ROCm/compute users, CUDA apps.
+# Any open fd on /dev/dri, /dev/kfd or /dev/nvidia* keeps the GPU driver's
+# refcount up and makes the module unload below fail (issues #64, #75, #92).
+# Escalate gently: wait, then SIGTERM, then SIGKILL.
+gpu_nodes=(/dev/dri/*)
+[[ -e /dev/kfd ]] && gpu_nodes+=(/dev/kfd)
+for node in /dev/nvidia[0-9]* /dev/nvidiactl /dev/nvidia-modeset /dev/nvidia-uvm; do
+    [[ -c "$node" ]] && gpu_nodes+=("$node")
+done
+if command -v fuser >/dev/null 2>&1; then
+    for attempt in $(seq 1 8); do
+        if ! fuser -s "${{gpu_nodes[@]}}" 2>/dev/null; then
+            break
+        fi
+        if [[ $attempt -eq 3 ]]; then
+            echo "Asking processes holding GPU device nodes to exit..."
+            fuser -k -TERM "${{gpu_nodes[@]}}" 2>/dev/null || true
+        elif [[ $attempt -ge 6 ]]; then
+            echo "Force-killing processes still holding GPU device nodes..."
+            fuser -k -KILL "${{gpu_nodes[@]}}" 2>/dev/null || true
+        fi
+        sleep 1
+    done
+fi
 
 # Detach virtual consoles from the GPU framebuffer. Unloading the GPU driver
 # while fbcon still renders the active TTY through it can hard-hang or even
@@ -624,8 +673,59 @@ echo "efi-framebuffer.0" > /sys/bus/platform/drivers/efi-framebuffer/unbind 2>/d
 echo "simple-framebuffer.0" > /sys/bus/platform/drivers/simple-framebuffer/unbind 2>/dev/null || true
 sleep 1
 
-# Unload driver modules
+# Release the GPU's audio sibling functions (e.g. the HDMI-audio codec on
+# function .1) from their drivers. A bound snd_hda_intel keeps the GPU's
+# power/refcount chain busy and blocks the driver unload, especially on
+# APUs (issue #64). Only audio-class functions (0x0401/0x0403) are touched:
+# APU slots also carry USB controllers, and the GPU itself is never unbound.
+gpu_slot="${{GPU_ADDR%.*}}"
+for dev in /sys/bus/pci/devices/"$gpu_slot".*; do
+    addr=$(basename "$dev")
+    if [[ "$addr" == "$GPU_ADDR" ]] || [[ ! -e "$dev/driver" ]]; then
+        continue
+    fi
+    class=$(cat "$dev/class" 2>/dev/null || echo "")
+    case "$class" in
+        0x0401*|0x0403*) ;;
+        *) continue ;;
+    esac
+    drv=$(basename "$(readlink "$dev/driver")")
+    if [[ "$drv" != "vfio-pci" ]]; then
+        echo "Releasing GPU audio function $addr from $drv..."
+        echo "$addr" > "$dev/driver/unbind" 2>/dev/null || true
+    fi
+done
+
+# Unload driver modules. Late holders (logind, user services) can take a
+# moment to let go, so retry before giving up (issue #64).
+echo "Unloading GPU driver modules..."
+for _ in $(seq 1 5); do
 {unload_modules_cmd}
+    if [[ ! -e "/sys/bus/pci/devices/$GPU_ADDR/driver" ]]; then
+        break
+    fi
+    drv=$(basename "$(readlink "/sys/bus/pci/devices/$GPU_ADDR/driver")")
+    if [[ "$drv" == "vfio-pci" ]]; then
+        break
+    fi
+    sleep 2
+done
+
+# Last resort, opt-in ONLY: release the device from its driver without
+# unloading the module. Standard passthrough tooling uses this unbind and it
+# does not care about the module refcount — but on some AMD APUs it has
+# hard-hung or even powered off the machine (issue #61), so it never runs
+# unless explicitly requested:
+#   sudo VMC_APU_FORCE_UNBIND=1 <this script>
+if [[ "${{VMC_APU_FORCE_UNBIND:-0}}" == "1" ]] && [[ -e "/sys/bus/pci/devices/$GPU_ADDR/driver" ]]; then
+    drv=$(basename "$(readlink "/sys/bus/pci/devices/$GPU_ADDR/driver")")
+    if [[ "$drv" != "vfio-pci" ]]; then
+        echo "WARNING: VMC_APU_FORCE_UNBIND=1 — attempting device unbind from '$drv'."
+        echo "WARNING: on some machines (esp. AMD APUs) this can hard-hang or power off."
+        echo "$GPU_ADDR" > "/sys/bus/pci/devices/$GPU_ADDR/driver/unbind" 2>/dev/null || true
+        sleep 3
+    fi
+fi
 
 # The GPU driver must have released the device by now. Force-unbinding a
 # driver that is still in use can hard-hang or power off the machine
@@ -636,6 +736,40 @@ if [[ -e "/sys/bus/pci/devices/$GPU_ADDR/driver" ]]; then
     if [[ "$current_driver" != "vfio-pci" ]]; then
         echo "ERROR: GPU is still bound to '$current_driver' — driver did not unload."
         echo "Something is still using the GPU. Aborting and restoring the display."
+        echo ""
+        echo "―― Diagnostics (please include these in bug reports) ――"
+        echo "Module usage:"
+        lsmod | head -n 1
+        lsmod | grep -E "^($ORIGINAL_DRIVER|drm|snd_hda_intel) " || true
+        # Scan /proc directly rather than trusting fuser alone: it misses
+        # processes in other mount namespaces (flatpak, containers) (#75).
+        echo "Processes with GPU device file descriptors (all namespaces):"
+        for fdlink in /proc/[0-9]*/fd/*; do
+            tgt=$(readlink "$fdlink" 2>/dev/null) || continue
+            case "$tgt" in
+                /dev/dri/*|/dev/kfd|/dev/nvidia*)
+                    pid="${{fdlink#/proc/}}"; pid="${{pid%%/*}}"
+                    echo "  pid $pid ($(cat /proc/$pid/comm 2>/dev/null)): $tgt"
+                    ;;
+            esac
+        done
+        # Framebuffer/console state: a still-attached fbcon is a classic
+        # invisible refcount holder on APUs (#75).
+        echo "Framebuffers:"
+        for fb in /sys/class/graphics/fb*; do
+            [[ -e "$fb" ]] && echo "  $(basename "$fb"): $(cat "$fb/name" 2>/dev/null)"
+        done
+        echo "Virtual console binds (1 = still attached):"
+        for vtcon in /sys/class/vtconsole/vtcon*; do
+            [[ -e "$vtcon" ]] && echo "  $(basename "$vtcon") bind=$(cat "$vtcon/bind" 2>/dev/null): $(cat "$vtcon/name" 2>/dev/null)"
+        done
+        echo "――――――――――――――――――――――――――――――――――――――"
+        echo ""
+        echo "If the diagnostics show no holders, the platform is keeping an"
+        echo "internal reference (common on AMD APUs). As a last resort you can"
+        echo "retry with device unbind instead of module unload:"
+        echo "  sudo VMC_APU_FORCE_UNBIND=1 $0"
+        echo "WARNING: on some APUs that can hang or power off the machine."
         exit 1
     fi
 fi
@@ -2160,6 +2294,157 @@ mod tests {
         assert!(script.contains("integrated GPU (APU)"));
     }
 
+    /// Issue #64: amdgpu only unloads once every DRM fd holder is gone. Before
+    /// attempting the module unload the script must wait for the display
+    /// manager to actually stop, sweep processes holding /dev/dri nodes, and
+    /// release the GPU's sibling PCI functions (e.g. HDMI audio).
+    #[test]
+    fn start_script_releases_drm_holders_before_unload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vm = test_vm(tmp.path());
+        let script = generate_start_script(&vm, &amd_gpu_config(None)).unwrap();
+
+        let unload = script
+            .find("modprobe -r amdgpu")
+            .expect("driver unload missing");
+        let dm_wait = script
+            .find("systemctl is-active --quiet \"$DISPLAY_MANAGER\"")
+            .expect("display-manager stop polling missing");
+        let drm_sweep = script
+            .find("fuser -k -TERM \"${gpu_nodes[@]}\"")
+            .expect("DRM fd holder sweep missing");
+        let sibling = script
+            .find("Releasing GPU audio function")
+            .expect("audio sibling release missing");
+
+        assert!(dm_wait < unload, "DM stop poll must precede driver unload");
+        assert!(drm_sweep < unload, "DRM sweep must precede driver unload");
+        assert!(
+            sibling < unload,
+            "sibling function release must precede driver unload"
+        );
+        // The sibling loop must skip the GPU function itself (force-unbinding
+        // the GPU is exactly what issue #61 forbids) and must only touch
+        // audio-class functions — APU slots also carry USB controllers whose
+        // unbind would kill the user's TTY keyboard.
+        assert!(script.contains("[[ \"$addr\" == \"$GPU_ADDR\" ]]"));
+        assert!(script.contains("0x0401*|0x0403*"));
+    }
+
+    /// Issue #64: the module unload is retried (late holders need a moment to
+    /// exit) instead of a single silent attempt.
+    #[test]
+    fn start_script_retries_module_unload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vm = test_vm(tmp.path());
+        let script = generate_start_script(&vm, &amd_gpu_config(None)).unwrap();
+
+        let retry = script
+            .find("for _ in $(seq 1 5); do")
+            .expect("unload retry loop missing");
+        let unload = script
+            .find("modprobe -r amdgpu")
+            .expect("driver unload missing");
+        assert!(retry < unload, "modprobe -r must run inside the retry loop");
+    }
+
+    /// The scripts are emitted from format! templates, so a stray brace or
+    /// quote breaks them silently — have bash itself syntax-check the output.
+    #[test]
+    fn generated_scripts_are_valid_bash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vm = test_vm(tmp.path());
+        let cfg = amd_gpu_config(None);
+
+        let start = generate_start_script(&vm, &cfg).unwrap();
+        let restore = generate_restore_script(&vm, &cfg);
+        for (name, content) in [("start", &start), ("restore", &restore)] {
+            let path = tmp.path().join(format!("{name}.sh"));
+            fs::write(&path, content).unwrap();
+            let out = std::process::Command::new("bash")
+                .arg("-n")
+                .arg(&path)
+                .output();
+            let Ok(out) = out else {
+                return; // bash not available in this environment — skip
+            };
+            assert!(
+                out.status.success(),
+                "{name} script has bash syntax errors:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    /// Issue #64: when the unload still fails, the abort message must include
+    /// diagnostics (module refcounts, /dev/dri holders) so bug reports tell us
+    /// what held the GPU.
+    #[test]
+    fn start_script_prints_unload_diagnostics_on_abort() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vm = test_vm(tmp.path());
+        let script = generate_start_script(&vm, &amd_gpu_config(None)).unwrap();
+
+        assert!(script.contains("driver did not unload"));
+        assert!(script.contains("Diagnostics (please include these in bug reports)"));
+        assert!(script.contains("lsmod"));
+        // Deep diagnostics (#75): namespace-proof /proc fd scan (fuser misses
+        // flatpak/containers), plus framebuffer and vtconsole state — the
+        // classic invisible refcount holders on APUs.
+        assert!(script.contains("/proc/[0-9]*/fd/*"));
+        assert!(script.contains("/dev/dri/*|/dev/kfd"));
+        assert!(script.contains("Framebuffers:"));
+        assert!(script.contains("Virtual console binds"));
+    }
+
+    /// Issue #75: /dev/kfd (amdgpu compute node) holders pin the module just
+    /// like /dev/dri holders, but were invisible to the sweep and diagnostics.
+    #[test]
+    fn start_script_sweeps_kfd_holders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vm = test_vm(tmp.path());
+        let script = generate_start_script(&vm, &amd_gpu_config(None)).unwrap();
+
+        let kfd = script
+            .find("[[ -e /dev/kfd ]] && gpu_nodes+=(/dev/kfd)")
+            .expect("kfd missing from GPU node sweep");
+        let unload = script
+            .find("modprobe -r amdgpu")
+            .expect("driver unload missing");
+        assert!(kfd < unload, "kfd sweep must precede driver unload");
+    }
+
+    /// Issue #75: device unbind (as opposed to module unload) is available as
+    /// a last resort, but ONLY behind an explicit env-var opt-in — on some AMD
+    /// APUs it hard-hangs or powers off the machine (issue #61), so it must
+    /// never run by default. The existing
+    /// `start_script_aborts_instead_of_force_unbinding_gpu` test continues to
+    /// guarantee there is no unconditional unbind.
+    #[test]
+    fn start_script_gates_device_unbind_behind_env_opt_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vm = test_vm(tmp.path());
+        let script = generate_start_script(&vm, &amd_gpu_config(None)).unwrap();
+
+        let gate = script
+            .find("\"${VMC_APU_FORCE_UNBIND:-0}\" == \"1\"")
+            .expect("force-unbind env gate missing");
+        let unbind = script
+            .find("> \"/sys/bus/pci/devices/$GPU_ADDR/driver/unbind\"")
+            .expect("gated device unbind missing");
+        assert!(
+            gate < unbind,
+            "device unbind must come after the env-var gate"
+        );
+        // The gated block must warn about the hang/power-off risk before
+        // touching sysfs, and the abort message must advertise the opt-in.
+        let warning = script
+            .find("can hard-hang or power off")
+            .expect("force-unbind warning missing");
+        assert!(warning > gate && warning < unbind);
+        assert!(script.contains("sudo VMC_APU_FORCE_UNBIND=1 $0"));
+    }
+
     #[test]
     fn filter_bindable_drops_host_bridge() {
         // The host bridge must never reach EXTRA_PCI_ADDRS regardless of host
@@ -2347,5 +2632,85 @@ echo after
         let vars = generate_variable_definitions(&vm, &components);
         assert!(!vars.contains("qemu-system-x86_64"));
         assert!(!vars.contains("echo after"));
+    }
+
+    fn nvidia_sddm_config() -> SingleGpuConfig {
+        use crate::hardware::{DisplayManager, GpuDriver, PciDevice};
+        let gpu = PciDevice {
+            address: "0000:01:00.0".to_string(),
+            vendor_id: 0x10de,
+            device_id: 0x2504,
+            vendor_name: "NVIDIA".to_string(),
+            device_name: "GeForce RTX 3060".to_string(),
+            class_code: 0x030000,
+            driver: Some("nvidia".to_string()),
+            iommu_group: Some(12),
+            is_boot_vga: true,
+            subsystem_vendor_id: 0,
+            subsystem_device_id: 0,
+        };
+        SingleGpuConfig {
+            gpu,
+            audio: None,
+            iommu_group_devices: Vec::new(),
+            original_driver: GpuDriver::Nvidia,
+            display_manager: DisplayManager::Sddm,
+            gpu_rom: None,
+            hide_kvm: true,
+        }
+    }
+
+    /// Issue #92: SDDM's Xorg outlives `systemctl stop sddm` and keeps
+    /// /dev/nvidia* open, so the module unload failed. The script must
+    /// (1) wait for the display server to exit before killing it and
+    /// (2) include the NVIDIA device nodes in the holder sweep, all before
+    /// the module unload.
+    #[test]
+    fn start_script_waits_for_display_server_and_sweeps_nvidia_nodes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vm = test_vm(tmp.path());
+        let script = generate_start_script(&vm, &nvidia_sddm_config()).unwrap();
+
+        let stop = script
+            .find("systemctl stop \"$DISPLAY_MANAGER\"")
+            .expect("display manager stop missing");
+        let wait = script
+            .find("pgrep -x \"$display_procs\"")
+            .expect("display-server wait loop missing");
+        let kill = script
+            .find("pkill -9 -x \"$proc\"")
+            .expect("compositor kill missing");
+        let sweep = script
+            .find("/dev/nvidia[0-9]* /dev/nvidiactl /dev/nvidia-modeset /dev/nvidia-uvm")
+            .expect("nvidia nodes missing from holder sweep");
+        let unload = script
+            .find("modprobe -r nvidia_drm")
+            .expect("nvidia unload missing");
+        assert!(stop < wait, "wait loop must follow the DM stop");
+        assert!(wait < kill, "kill must come after the wait");
+        assert!(kill < sweep, "holder sweep must follow the kill");
+        assert!(sweep < unload, "sweep must precede the module unload");
+        // Diagnostics name NVIDIA holders too.
+        assert!(script.contains("/dev/dri/*|/dev/kfd|/dev/nvidia*)"));
+    }
+
+    /// The NVIDIA start script must pass bash's own syntax check, like the
+    /// AMD one already does.
+    #[test]
+    fn nvidia_start_script_is_valid_bash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vm = test_vm(tmp.path());
+        let script = generate_start_script(&vm, &nvidia_sddm_config()).unwrap();
+        let path = tmp.path().join("start.sh");
+        std::fs::write(&path, &script).unwrap();
+        let out = std::process::Command::new("bash")
+            .args(["-n", path.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }
