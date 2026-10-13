@@ -4,7 +4,7 @@ A fast and friendly Rust TUI for managing desktop QEMU/KVM virtual machines — 
 
 ### Changelog
 
-**Unreleased**
+**v1.5.0**
 - **Virtual Disk Resize** (thanks @HenriqueCrj, #94): New **Resize Storage** management action grows a VM's raw or qcow2 system disk in place with `qemu-img resize` — with a disk picker for multi-disk VMs, refusing to shrink, to touch physical disks or firmware images, or to resize a running VM; expand the guest partition afterwards
 - **Fix Duplicated Disks in VM Info** (thanks @adonespitogo, #86): Disk parsing is scoped to the default boot invocation of `launch.sh`, so drives from the `--install`/`--cdrom` branches no longer show up as duplicates or literal `$2` paths
 - **Fix VMs on a Managed Network Losing Connectivity** (thanks @adonespitogo, #87): `net-up.sh` now tells NetworkManager to leave vm-curator's bridges and tap devices unmanaged, so it can no longer silently detach a VM's tap from the bridge
@@ -37,10 +37,6 @@ A fast and friendly Rust TUI for managing desktop QEMU/KVM virtual machines — 
 - **Fix USB Passthrough Launch Handling** (#66): Launching from the TUI no longer passes USB QEMU flags as shell options `launch.sh` can't parse — the USB section saved in the script is the single source of truth
 - **Fix UEFI Boot Delays from Stale NVRAM Entries** (#66): Normal UEFI boots now pin the disk first (`-boot strict=on` + virtio `bootindex=0`), so guests that once registered PXE/HTTP boot entries stop waiting on network boot every start
 - **Keep Management Screens Open When Saving Fails** (#66): A failed save from the USB/PCI/Shared Folders unsaved-changes prompt no longer closes the screen and discards your selections
-
-**v1.2.3**
-- **Hide-KVM Toggle for Single-GPU Passthrough** (#71): The hypervisor-hiding CPU flags (`kvm=off,hv_vendor_id=…`) previously emitted only for NVIDIA are now a per-VM toggle (`[h]` in the Single GPU Setup screen) that defaults **on for AMD too** — fixes Code 43 / black screen in Windows guests on modern AMD cards like the RX 9070 XT; regenerate scripts to apply
-- **Fix App Quitting When Typing 'q' in Settings** (#72): Editing a Settings value containing `q` (e.g. a path like `~/qemu-vms`) no longer quits the app — `q` still quits when just browsing
 
 [Full changelog](CHANGELOG.md)
 
