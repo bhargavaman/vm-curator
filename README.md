@@ -22,6 +22,7 @@ A fast and friendly Rust TUI for managing desktop QEMU/KVM virtual machines — 
 - **QEMU Windows Titled After the VM** (thanks @jeffsauer, #96): Launch scripts pass `-name` with the VM directory name, so windows are titled `QEMU (<vm-dir>)` and window-manager rules can target each VM; existing VMs are patched on next launch
 - **Fix Haiku Installer Seeing No Disk** (thanks @jeffsauer, #93): The Haiku profile now attaches the disk via AHCI instead of virtio-blk, which Haiku's installer doesn't enumerate; existing Haiku VMs can switch `if=virtio` to `if=ide` in `launch.sh`
 - **Fix Single-GPU Start Script Failing to Unload the Driver** (thanks @ProgrammerManSudjo, #92; also #64, #75): `single-gpu-start.sh` now waits for the display server to exit, sweeps processes holding `/dev/dri`, `/dev/kfd` or `/dev/nvidia*` with escalating signals, and retries the module unload — instead of a fixed sleep and a single attempt. Failures print real diagnostics; regenerate scripts with `g` in Single GPU Setup
+- **Fix GPU Shown Under the Wrong Name** (thanks @ProgrammerManSudjo, #91): Device names now come from the host's `pci.ids` (what `lspci` prints) with a corrected built-in fallback, so an RTX 3060 is no longer labelled a 3060 Ti
 
 **v1.4.0**
 - **Physical Disk Passthrough as Boot Device** (#80): Pass whole NVMe/SATA/USB disks straight through to guests — a new **Physical Disk** mode in the creation wizard (with a safety-filtered picker that excludes the host system disk, mounted disks, and LVM/swap members) and a **Passthrough Disks** management screen for existing VMs, with per-disk boot index; USB passthrough gains a boot-index option too. Also fixes a latent bug where Fedora's qcow2 OVMF firmware could be mistaken for the VM's disk — letting Reset VM delete it
@@ -467,7 +468,7 @@ facts = ["Fact 1", "Fact 2"]
   - Arch: `sudo pacman -S qemu-desktop edk2-ovmf swtpm`
   - If the Change Display screen offers only `vnc`/`none`, that's the sign QEMU was installed without its GUI modules
 - **Build**: a recent Rust stable toolchain (see `rust-toolchain.toml`), libudev-dev (Debian/Ubuntu) or systemd-libs (Arch)
-- **Optional**: OVMF/edk2 (UEFI), swtpm (Windows 11 TPM), virt-viewer (SPICE-app), passt (networking), dnsmasq + nftables/iptables (managed virtual networks), Looking Glass client (multi-GPU), polkit (bridge networking)
+- **Optional**: OVMF/edk2 (UEFI), swtpm (Windows 11 TPM), virt-viewer (SPICE-app), passt (networking), dnsmasq + nftables/iptables (managed virtual networks), Looking Glass client (multi-GPU), polkit (bridge networking), hwdata / pci.ids (exact PCI device names in the passthrough screens)
 
 ### Cross-Distribution Compatibility
 

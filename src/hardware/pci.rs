@@ -462,44 +462,167 @@ fn read_iommu_group(path: &Path) -> Option<u32> {
 
 /// Get PCI vendor and device names
 fn get_pci_names(vendor_id: u16, device_id: u16, class_code: u32) -> (String, String) {
-    // Known vendors
-    let vendor_name = match vendor_id {
-        0x10de => "NVIDIA".to_string(),
-        0x1002 => "AMD/ATI".to_string(),
-        0x8086 => "Intel".to_string(),
-        0x1022 => "AMD".to_string(),
-        0x14e4 => "Broadcom".to_string(),
-        0x10ec => "Realtek".to_string(),
-        0x1b4b => "Marvell".to_string(),
-        0x144d => "Samsung".to_string(),
-        0x15b7 => "SanDisk".to_string(),
-        0x1987 => "Phison".to_string(),
-        0x1c5c => "SK hynix".to_string(),
-        0x126f => "Silicon Motion".to_string(),
-        0x1e0f => "KIOXIA".to_string(),
-        _ => String::new(),
+    let db = pci_ids_db();
+    get_pci_names_with(db.as_ref(), vendor_id, device_id, class_code)
+}
+
+/// [`get_pci_names`] with an explicit (possibly absent) `pci.ids` database.
+///
+/// Resolution order for the device name: the host's `pci.ids` (what `lspci`
+/// prints — authoritative, covers every variant), then the small built-in
+/// table, then the PCI class description. The built-in table alone misnamed
+/// cards (an RTX 3060 shown as a 3060 Ti, #91).
+fn get_pci_names_with(
+    db: Option<&PciIdsDb>,
+    vendor_id: u16,
+    device_id: u16,
+    class_code: u32,
+) -> (String, String) {
+    // Short vendor names read better in the TUI than pci.ids' legal names
+    // ("NVIDIA Corporation", "Advanced Micro Devices, Inc. [AMD/ATI]").
+    let short_vendor = match vendor_id {
+        0x10de => "NVIDIA",
+        0x1002 => "AMD/ATI",
+        0x8086 => "Intel",
+        0x1022 => "AMD",
+        0x14e4 => "Broadcom",
+        0x10ec => "Realtek",
+        0x1b4b => "Marvell",
+        0x144d => "Samsung",
+        0x15b7 => "SanDisk",
+        0x1987 => "Phison",
+        0x1c5c => "SK hynix",
+        0x126f => "Silicon Motion",
+        0x1e0f => "KIOXIA",
+        _ => "",
+    };
+    let vendor_name = if short_vendor.is_empty() {
+        db.and_then(|d| d.vendor(vendor_id)).unwrap_or_default()
+    } else {
+        short_vendor.to_string()
     };
 
-    // Try to get device name from specific known devices or use class description
-    let device_name = get_known_device_name(vendor_id, device_id)
+    let device_name = db
+        .and_then(|d| d.device(vendor_id, device_id))
+        .map(|name| marketing_name(&name))
+        .or_else(|| get_known_device_name(vendor_id, device_id))
         .unwrap_or_else(|| get_class_description(class_code).to_string());
 
     (vendor_name, device_name)
 }
 
-/// Get known device names for common devices
+/// `pci.ids` names GPUs as `<chip> [<marketing name>]`, e.g.
+/// `GA106 [GeForce RTX 3060 Lite Hash Rate]`. The bracketed part is what
+/// users recognise, so prefer it when present.
+fn marketing_name(full: &str) -> String {
+    if let (Some(open), Some(close)) = (full.rfind('['), full.rfind(']')) {
+        if open < close {
+            let inner = full[open + 1..close].trim();
+            if !inner.is_empty() {
+                return inner.to_string();
+            }
+        }
+    }
+    full.trim().to_string()
+}
+
+/// Where distros install the PCI ID database (hwdata / pciutils).
+const PCI_IDS_PATHS: &[&str] = &[
+    "/usr/share/hwdata/pci.ids",                   // Fedora, Arch, openSUSE
+    "/usr/share/misc/pci.ids",                     // Debian, Ubuntu
+    "/usr/share/pci.ids",                          // some pciutils builds
+    "/run/current-system/sw/share/hwdata/pci.ids", // NixOS with hwdata
+    "/var/lib/pciutils/pci.ids",
+];
+
+/// Parsed subset of `pci.ids`: vendor names and (vendor, device) names.
+/// Subsystem lines are ignored.
+#[derive(Debug, Default)]
+struct PciIdsDb {
+    vendors: std::collections::HashMap<u16, String>,
+    devices: std::collections::HashMap<(u16, u16), String>,
+}
+
+impl PciIdsDb {
+    /// Parse `pci.ids` text. Tolerant: unknown lines are skipped.
+    fn parse(text: &str) -> Self {
+        let mut db = Self::default();
+        let mut current_vendor: Option<u16> = None;
+        for line in text.lines() {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if line.starts_with("\t\t") {
+                continue; // subsystem entry
+            }
+            if let Some(rest) = line.strip_prefix('\t') {
+                // Device line: "<devid>  <name>"
+                let Some(vendor) = current_vendor else {
+                    continue;
+                };
+                if let Some((id, name)) = split_id_line(rest) {
+                    db.devices.insert((vendor, id), name);
+                }
+            } else if line.starts_with('C') {
+                // Class section ("C 03  Display controller") ends the vendor list.
+                current_vendor = None;
+            } else if let Some((id, name)) = split_id_line(line) {
+                current_vendor = Some(id);
+                db.vendors.insert(id, name);
+            }
+        }
+        db
+    }
+
+    fn vendor(&self, vendor_id: u16) -> Option<String> {
+        self.vendors.get(&vendor_id).cloned()
+    }
+
+    fn device(&self, vendor_id: u16, device_id: u16) -> Option<String> {
+        self.devices.get(&(vendor_id, device_id)).cloned()
+    }
+}
+
+/// "2504  GA106 [GeForce RTX 3060 Lite Hash Rate]" → (0x2504, name)
+fn split_id_line(line: &str) -> Option<(u16, String)> {
+    let (id, name) = line.split_once("  ")?;
+    let id = u16::from_str_radix(id.trim(), 16).ok()?;
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some((id, name.to_string()))
+}
+
+/// The host's `pci.ids`, loaded once. `None` when no copy is installed.
+fn pci_ids_db() -> &'static Option<PciIdsDb> {
+    static DB: std::sync::OnceLock<Option<PciIdsDb>> = std::sync::OnceLock::new();
+    DB.get_or_init(|| {
+        PCI_IDS_PATHS
+            .iter()
+            .find_map(|p| fs::read_to_string(p).ok())
+            .map(|text| PciIdsDb::parse(&text))
+    })
+}
+
+/// Built-in names for common GPUs, used only when the host has no `pci.ids`.
+///
+/// Every entry is verified against upstream `pci.ids`. Several IDs map to a
+/// family rather than one SKU (AMD reuses one ID across XT/XTX/GRE), so the
+/// name lists the variants instead of guessing one (#91).
 fn get_known_device_name(vendor_id: u16, device_id: u16) -> Option<String> {
     // Common NVIDIA GPUs
     if vendor_id == 0x10de {
         let name = match device_id {
             // RTX 50 series (Blackwell)
-            0x2B84 => "GeForce RTX 5090",
-            0x2B85 => "GeForce RTX 5080",
-            0x2B86 => "GeForce RTX 5070 Ti",
-            0x2B87 => "GeForce RTX 5070",
-            0x2B88 => "GeForce RTX 5060 Ti",
-            0x2B89 => "GeForce RTX 5060",
-            // RTX 40 series
+            0x2b85 => "GeForce RTX 5090",
+            0x2b87 => "GeForce RTX 5090 D",
+            0x2c02 => "GeForce RTX 5080",
+            0x2c05 => "GeForce RTX 5070 Ti",
+            0x2c09 | 0x2f04 => "GeForce RTX 5070",
+            0x2d04 => "GeForce RTX 5060 Ti",
+            0x2d05 | 0x2f06 => "GeForce RTX 5060",
+            // RTX 40 series (Ada)
             0x2684 => "GeForce RTX 4090",
             0x2702 => "GeForce RTX 4080 SUPER",
             0x2704 => "GeForce RTX 4080",
@@ -507,23 +630,33 @@ fn get_known_device_name(vendor_id: u16, device_id: u16) -> Option<String> {
             0x2782 => "GeForce RTX 4070 Ti",
             0x2783 => "GeForce RTX 4070 SUPER",
             0x2786 => "GeForce RTX 4070",
-            0x2860 => "GeForce RTX 4060",
-            0x2882 => "GeForce RTX 4060 Ti",
-            // RTX 30 series
+            0x2803 => "GeForce RTX 4060 Ti",
+            0x2805 => "GeForce RTX 4060 Ti 16GB",
+            0x2882 => "GeForce RTX 4060",
+            // RTX 30 series (Ampere)
             0x2204 => "GeForce RTX 3090",
             0x2206 => "GeForce RTX 3080",
             0x2208 => "GeForce RTX 3080 Ti",
+            0x220a => "GeForce RTX 3080 12GB",
+            0x2216 => "GeForce RTX 3080 Lite Hash Rate",
             0x2484 => "GeForce RTX 3070",
-            0x2488 => "GeForce RTX 3070 Ti",
-            0x2504 => "GeForce RTX 3060 Ti",
-            0x2544 => "GeForce RTX 3060",
+            0x2488 => "GeForce RTX 3070 Lite Hash Rate",
+            0x2486 => "GeForce RTX 3060 Ti",
+            0x2489 => "GeForce RTX 3060 Ti Lite Hash Rate",
+            0x2503 | 0x2544 => "GeForce RTX 3060",
+            0x2504 => "GeForce RTX 3060 Lite Hash Rate",
+            0x2507 => "GeForce RTX 3050",
             // RTX 20 series (Turing)
-            0x1E04 => "GeForce RTX 2080 Ti",
-            0x1E82 => "GeForce RTX 2080",
-            0x1E84 => "GeForce RTX 2070 SUPER",
-            0x1F02 => "GeForce RTX 2070",
-            0x1F07 => "GeForce RTX 2060 SUPER",
-            0x1F08 => "GeForce RTX 2060",
+            0x1e04 => "GeForce RTX 2080 Ti",
+            0x1e07 => "GeForce RTX 2080 Ti Rev. A",
+            0x1e82 => "GeForce RTX 2080",
+            0x1e87 => "GeForce RTX 2080 Rev. A",
+            0x1e84 => "GeForce RTX 2070 SUPER",
+            0x1f02 => "GeForce RTX 2070",
+            0x1f07 => "GeForce RTX 2070 Rev. A",
+            0x1f06 | 0x1f42 | 0x1f47 => "GeForce RTX 2060 SUPER",
+            0x1e89 | 0x1f08 => "GeForce RTX 2060",
+            0x1f03 => "GeForce RTX 2060 12GB",
             // Audio devices
             0x10f9 | 0x10f8 | 0x10f7 | 0x228b | 0x22bd => "HD Audio Controller",
             _ => return None,
@@ -534,22 +667,24 @@ fn get_known_device_name(vendor_id: u16, device_id: u16) -> Option<String> {
     // Common AMD GPUs
     if vendor_id == 0x1002 {
         let name = match device_id {
-            // RX 7000 series
-            0x744c => "Radeon RX 7900 XTX",
-            0x7448 => "Radeon RX 7900 XT",
-            0x747e => "Radeon RX 7900 GRE",
-            0x7470 => "Radeon RX 7800 XT",
-            0x7480 => "Radeon RX 7700 XT",
-            // RX 6000 series
-            0x73bf => "Radeon RX 6900 XT",
-            0x73a5 => "Radeon RX 6800 XT",
-            0x73a3 => "Radeon RX 6800",
-            0x73df => "Radeon RX 6700 XT",
             // RX 9000 series (RDNA 4)
-            0x7500 => "Radeon RX 9070 XT",
-            0x7501 => "Radeon RX 9070",
-            0x7502 => "Radeon RX 9600 XT",
-            0x7503 => "Radeon RX 9600",
+            0x7550 => "Radeon RX 9070 XT / 9070 / 9070 GRE",
+            0x7590 => "Radeon RX 9060 XT / 9050",
+            // RX 7000 series (RDNA 3)
+            0x744c => "Radeon RX 7900 XTX / 7900 XT / 7900 GRE",
+            0x7448 => "Radeon Pro W7900",
+            0x747e => "Radeon RX 7800 XT / 7700 XT",
+            0x7470 => "Radeon PRO W7700",
+            0x7480 => "Radeon RX 7600 / 7600 XT",
+            // RX 6000 series (RDNA 2)
+            0x73bf => "Radeon RX 6900 XT / 6800 XT / 6800",
+            0x73a5 => "Radeon RX 6950 XT",
+            0x73df => "Radeon RX 6700 XT / 6750 XT",
+            0x73ff => "Radeon RX 6600 / 6600 XT",
+            0x73ef => "Radeon RX 6650 XT",
+            // RX 5000 series (RDNA)
+            0x731f => "Radeon RX 5700 XT / 5700 / 5600 XT",
+            0x7340 => "Radeon RX 5500 / 5500 XT",
             // Audio devices
             0xab38 | 0xab28 => "HD Audio Controller",
             _ => return None,
@@ -562,6 +697,11 @@ fn get_known_device_name(vendor_id: u16, device_id: u16) -> Option<String> {
 
 /// Get class description from class code
 fn get_class_description(class_code: u32) -> &'static str {
+    // NVMe is a full 24-bit class (01:08:02); the masked match below never
+    // hits it, so check the exact value first.
+    if class_code == class_codes::NVME_CONTROLLER {
+        return "NVMe Controller";
+    }
     let class_base = class_code & 0xFFFF00;
     match class_base {
         class_codes::VGA_COMPATIBLE => "VGA Controller",
