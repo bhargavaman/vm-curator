@@ -119,3 +119,93 @@ fn integrated_gpu_detection() {
     audio.class_code = 0x040300;
     assert!(!audio.is_integrated_gpu());
 }
+
+// --- Device naming: pci.ids first, corrected table as fallback (#91) ------
+
+const PCI_IDS_FIXTURE: &str = "\
+#\tList of PCI ID's (fixture)
+#
+1002  Advanced Micro Devices, Inc. [AMD/ATI]
+\t744c  Navi 31 [Radeon RX 7900 XT/7900 XTX/7900 GRE/7900M]
+\t\t1002 0e3b  Radeon RX 7900 XTX
+10de  NVIDIA Corporation
+\t2486  GA104 [GeForce RTX 3060 Ti]
+\t2504  GA106 [GeForce RTX 3060 Lite Hash Rate]
+\t\t1458 404f  GeForce RTX 3060 (some partner card)
+\t2544  GA106 [GeForce RTX 3060]
+1b4b  Marvell Technology Group Ltd.
+beef  Example Vendor Without Brackets
+\t0001  Plain Device Name
+C 03  Display controller
+\t00  VGA compatible controller
+";
+
+#[test]
+fn pci_ids_parse_reads_vendors_and_devices_but_not_subsystems() {
+    let db = PciIdsDb::parse(PCI_IDS_FIXTURE);
+    assert_eq!(db.vendor(0x10de).as_deref(), Some("NVIDIA Corporation"));
+    assert_eq!(
+        db.device(0x10de, 0x2504).as_deref(),
+        Some("GA106 [GeForce RTX 3060 Lite Hash Rate]")
+    );
+    assert_eq!(
+        db.device(0xbeef, 0x0001).as_deref(),
+        Some("Plain Device Name")
+    );
+    // Subsystem lines must not be mistaken for devices, and the class
+    // section must not be parsed as a vendor.
+    assert!(db.device(0x10de, 0x1458).is_none());
+    assert!(db.device(0x10de, 0x404f).is_none());
+    assert!(db.vendor(0x0003).is_none());
+    assert!(db.device(0x0003, 0x0000).is_none());
+}
+
+#[test]
+fn rtx_3060_is_not_reported_as_a_3060_ti() {
+    // Issue #91: 10de:2504 is a GA106 RTX 3060 (LHR); the 3060 Ti is GA104.
+    let db = PciIdsDb::parse(PCI_IDS_FIXTURE);
+    let (vendor, device) = get_pci_names_with(Some(&db), 0x10de, 0x2504, 0x030000);
+    assert_eq!(vendor, "NVIDIA");
+    assert_eq!(device, "GeForce RTX 3060 Lite Hash Rate");
+    assert!(!device.contains("Ti"));
+
+    // Without pci.ids the corrected built-in table agrees.
+    let (_, fallback) = get_pci_names_with(None, 0x10de, 0x2504, 0x030000);
+    assert_eq!(fallback, "GeForce RTX 3060 Lite Hash Rate");
+    let (_, ti) = get_pci_names_with(None, 0x10de, 0x2486, 0x030000);
+    assert_eq!(ti, "GeForce RTX 3060 Ti");
+}
+
+#[test]
+fn marketing_name_prefers_bracketed_part() {
+    assert_eq!(
+        marketing_name("GA106 [GeForce RTX 3060 Lite Hash Rate]"),
+        "GeForce RTX 3060 Lite Hash Rate"
+    );
+    assert_eq!(marketing_name("Plain Device Name"), "Plain Device Name");
+    assert_eq!(marketing_name("Odd [] Empty"), "Odd [] Empty");
+    assert_eq!(
+        marketing_name("  Navi 31 [Radeon RX 7900 XT/7900 XTX]  "),
+        "Radeon RX 7900 XT/7900 XTX"
+    );
+}
+
+#[test]
+fn pci_ids_db_takes_precedence_over_table_and_class_fallback_remains() {
+    let db = PciIdsDb::parse(PCI_IDS_FIXTURE);
+    // pci.ids wins over the built-in table (which says "7900 XTX / 7900 XT / 7900 GRE").
+    let (vendor, device) = get_pci_names_with(Some(&db), 0x1002, 0x744c, 0x030000);
+    assert_eq!(vendor, "AMD/ATI");
+    assert_eq!(device, "Radeon RX 7900 XT/7900 XTX/7900 GRE/7900M");
+    // Short vendor names are kept for well-known vendors; pci.ids fills the rest.
+    let (vendor, device) = get_pci_names_with(Some(&db), 0xbeef, 0x0001, 0x020000);
+    assert_eq!(vendor, "Example Vendor Without Brackets");
+    assert_eq!(device, "Plain Device Name");
+    // Unknown everywhere: class description, empty vendor.
+    let (vendor, device) = get_pci_names_with(Some(&db), 0xbeef, 0x0002, 0x020000);
+    assert_eq!(vendor, "Example Vendor Without Brackets");
+    assert_eq!(device, "Network Controller");
+    let (vendor, device) = get_pci_names_with(None, 0xdead, 0x0002, 0x010802);
+    assert_eq!(vendor, "");
+    assert_eq!(device, "NVMe Controller");
+}
