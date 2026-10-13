@@ -23,6 +23,7 @@ A fast and friendly Rust TUI for managing desktop QEMU/KVM virtual machines — 
 - **Fix Haiku Installer Seeing No Disk** (thanks @jeffsauer, #93): The Haiku profile now attaches the disk via AHCI instead of virtio-blk, which Haiku's installer doesn't enumerate; existing Haiku VMs can switch `if=virtio` to `if=ide` in `launch.sh`
 - **Fix Single-GPU Start Script Failing to Unload the Driver** (thanks @ProgrammerManSudjo, #92; also #64, #75): `single-gpu-start.sh` now waits for the display server to exit, sweeps processes holding `/dev/dri`, `/dev/kfd` or `/dev/nvidia*` with escalating signals, and retries the module unload — instead of a fixed sleep and a single attempt. Failures print real diagnostics; regenerate scripts with `g` in Single GPU Setup
 - **Fix GPU Shown Under the Wrong Name** (thanks @ProgrammerManSudjo, #91): Device names now come from the host's `pci.ids` (what `lspci` prints) with a corrected built-in fallback, so an RTX 3060 is no longer labelled a 3060 Ti
+- **Overhaul Multi-GPU Passthrough VFIO Binding** (thanks @travbp, #25): Binds can no longer hang silently — every unbind is timeout-guarded, GPUs get a compositor-release step, the script refuses to take the GPU driving your desktop, IOMMU-group siblings are auto-included, and all diagnostics land in `passthrough.log` in the VM folder
 
 **v1.4.0**
 - **Physical Disk Passthrough as Boot Device** (#80): Pass whole NVMe/SATA/USB disks straight through to guests — a new **Physical Disk** mode in the creation wizard (with a safety-filtered picker that excludes the host system disk, mounted disks, and LVM/swap members) and a **Passthrough Disks** management screen for existing VMs, with per-disk boot index; USB passthrough gains a boot-index option too. Also fixes a latent bug where Fedora's qcow2 OVMF firmware could be mistaken for the VM's disk — letting Reset VM delete it
@@ -485,7 +486,28 @@ To pin a specific firmware build, or on a host whose firmware lives somewhere un
 
 ---
 
-### Contributing
+### Troubleshooting
+
+**`launch.sh` hangs at "Binding PCI devices to vfio-pci..."**
+
+Re-run with verbose output to see exactly which device hangs:
+
+```bash
+VM_CURATOR_DEBUG=1 ./launch.sh
+```
+
+The most common causes:
+
+1. **Active host driver on the GPU.** On hybrid laptops with a MUX switch, leaving both GPUs enabled means the host's `nvidia` driver is actively using the discrete GPU. Unbinding it then blocks in the kernel until the driver releases. Fix: disable the discrete GPU on the host (MUX off, or blacklist `nvidia`/`nouveau`, or early-bind via kernel cmdline `vfio-pci.ids=<vendor:device>`) before launching the VM.
+2. **IOMMU group has unbound siblings.** If the GPU and its audio function (or any other non-bridge device) share an IOMMU group, all of them must be passed through together. Open the PCI Passthrough screen (`p` from the VM management menu), select the GPU, and press `a` to auto-include every group sibling. vm-curator now does this automatically when you toggle a device, but VMs created with older builds may need the `a` keybinding once.
+
+To inspect your IOMMU group layout:
+
+```bash
+ls /sys/kernel/iommu_groups/*/devices
+```
+
+
 
 Contributions are welcome! If you find a bug or have an idea for an improvement, feel free to open an issue or submit a Pull Request.
 
