@@ -17,6 +17,7 @@ A fast and friendly Rust TUI for managing desktop QEMU/KVM virtual machines — 
 - **Fix Generated Scripts Not Executable on NixOS**: All generated scripts use `#!/usr/bin/env bash`, so running `./launch.sh` by hand and the sudo-executed network and single-GPU scripts work where `/bin/bash` doesn't exist
 - **SMB Shared Folders for Windows Guests** (thanks @ahmutkadim, #101): Press `m` on a shared folder to switch it to QEMU's built-in SMB server — the guest opens `\\10.0.2.4\qemu` with no driver install (Windows-profile VMs default to it); needs the `samba` package on the host and user-mode networking
 - **Fix Create/Edit Network Form Hiding How to Save** (thanks @sae-lco, #100): The form gains a `[ Save ] [ Cancel ]` button row (Enter activates), and its help text wraps and stays visible on narrow or short terminals instead of clipping off the `[s] Save` hint
+- **Document How to Swap Floppies/CDs During an Install** (thanks @Revali25, #99): The Boot Options screen and the README now explain QEMU's monitor tab (`View → compatmonitor0`, then `change floppy0 <img>`) for multi-disk installs
 
 **v1.4.0**
 - **Physical Disk Passthrough as Boot Device** (#80): Pass whole NVMe/SATA/USB disks straight through to guests — a new **Physical Disk** mode in the creation wizard (with a safety-filtered picker that excludes the host system disk, mounted disks, and LVM/swap members) and a **Passthrough Disks** management screen for existing VMs, with per-disk boot index; USB passthrough gains a boot-index option too. Also fixes a latent bug where Fedora's qcow2 OVMF firmware could be mistaken for the VM's disk — letting Reset VM delete it
@@ -266,6 +267,19 @@ vm-curator snapshot windows-95 delete my-snapshot
 vm-curator emulators
 ```
 
+
+#### Swapping Floppies or CDs During an Install
+
+Multi-disk installs (MS-DOS, Windows 3.1/95 on floppies, multi-CD sets) need the next image swapped in while the VM is running. That happens in QEMU's own monitor, which the default GTK display exposes as a tab: in the QEMU window open **View → compatmonitor0** and type
+
+```
+change floppy0 /path/to/disk2.img      # next floppy
+change ide1-cd0 /path/to/disc2.iso     # next CD-ROM
+eject floppy0                          # remove the floppy
+info block                             # list drive names if yours differ
+```
+
+then switch back to the **VGA** tab and continue in the guest. Start the first disk from **Boot Options → Boot with floppy image** (or **Boot with custom ISO**); the Boot Options screen shows this tip too. The monitor tab is a GTK display feature — with SDL use Ctrl+Alt+2 to reach the monitor and Ctrl+Alt+1 to return.
 ### Key Bindings
 
 #### Main Menu
@@ -296,7 +310,7 @@ vm-curator emulators
 | `Esc` | Back |
 
 Management menu options:
-- Boot Options (normal, install, custom ISO)
+- Boot Options (normal, install, custom ISO, recovery DMG, floppy image; shows how to swap media mid-install)
 - Snapshots
 - USB Passthrough
 - PCI Passthrough

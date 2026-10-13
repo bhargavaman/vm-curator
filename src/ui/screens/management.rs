@@ -1,6 +1,6 @@
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
 use crate::app::App;
@@ -310,8 +310,8 @@ pub fn render(app: &App, frame: &mut Frame) {
 /// Render boot options submenu
 pub fn render_boot_options(app: &App, frame: &mut Frame) {
     let area = frame.area();
-    let dialog_width = 50.min(area.width.saturating_sub(4));
-    let dialog_height = 16.min(area.height.saturating_sub(4));
+    let dialog_width = 56.min(area.width.saturating_sub(4));
+    let dialog_height = 20.min(area.height.saturating_sub(4));
 
     let dialog_area = centered_rect(dialog_width, dialog_height, area);
     frame.render_widget(Clear, dialog_area);
@@ -341,6 +341,7 @@ pub fn render_boot_options(app: &App, frame: &mut Frame) {
         .constraints([
             Constraint::Length(1), // Top padding
             Constraint::Min(1),    // Content
+            Constraint::Length(4), // Media-swap tip (#99)
         ])
         .split(h_chunks[1]);
 
@@ -385,7 +386,19 @@ pub fn render_boot_options(app: &App, frame: &mut Frame) {
 
     let list = List::new(items);
     frame.render_stateful_widget(list, v_chunks[1], &mut state);
+
+    // Multi-disk installs (DOS, early Windows) need the next floppy or CD
+    // swapped in while the VM runs; that happens in QEMU's own monitor, which
+    // the GTK display exposes as a tab (#99).
+    let tip = Paragraph::new(BOOT_OPTIONS_MEDIA_TIP)
+        .style(Style::default().fg(Color::DarkGray))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(tip, v_chunks[2]);
 }
+
+/// How to swap floppy/CD images on a running VM (shown under Boot Options).
+pub const BOOT_OPTIONS_MEDIA_TIP: &str = "Need the next disk mid-install? In the QEMU window: \
+     View > compatmonitor0, then  change floppy0 <img>  or  change ide1-cd0 <iso>";
 
 /// Render display options submenu
 pub fn render_display_options(app: &App, frame: &mut Frame) {
