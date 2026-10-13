@@ -198,6 +198,8 @@ fn find_bridge_helper() -> Option<PathBuf> {
         "/usr/lib/qemu/qemu-bridge-helper",
         "/usr/libexec/qemu-bridge-helper",
         "/usr/libexec/qemu/qemu-bridge-helper",
+        // NixOS installs the setuid wrapper here (thanks @pimkoter, #89)
+        "/run/wrappers/bin/qemu-bridge-helper",
     ];
 
     for path in paths {

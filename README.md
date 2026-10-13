@@ -4,6 +4,12 @@ A fast and friendly Rust TUI for managing desktop QEMU/KVM virtual machines — 
 
 ### Changelog
 
+**Unreleased**
+- **Virtual Disk Resize** (thanks @HenriqueCrj, #94): New **Resize Storage** management action grows a VM's raw or qcow2 system disk in place with `qemu-img resize` — with a disk picker for multi-disk VMs, refusing to shrink, to touch physical disks or firmware images, or to resize a running VM; expand the guest partition afterwards
+- **Fix Duplicated Disks in VM Info** (thanks @adonespitogo, #86): Disk parsing is scoped to the default boot invocation of `launch.sh`, so drives from the `--install`/`--cdrom` branches no longer show up as duplicates or literal `$2` paths
+- **Fix VMs on a Managed Network Losing Connectivity** (thanks @adonespitogo, #87): `net-up.sh` now tells NetworkManager to leave vm-curator's bridges and tap devices unmanaged, so it can no longer silently detach a VM's tap from the bridge
+- **Find `qemu-bridge-helper` on NixOS** (thanks @pimkoter, #89): The bridge-helper lookup also checks `/run/wrappers/bin`
+
 **v1.4.0**
 - **Physical Disk Passthrough as Boot Device** (#80): Pass whole NVMe/SATA/USB disks straight through to guests — a new **Physical Disk** mode in the creation wizard (with a safety-filtered picker that excludes the host system disk, mounted disks, and LVM/swap members) and a **Passthrough Disks** management screen for existing VMs, with per-disk boot index; USB passthrough gains a boot-index option too. Also fixes a latent bug where Fedora's qcow2 OVMF firmware could be mistaken for the VM's disk — letting Reset VM delete it
 - **Virtual Network Manager** (#53): Create, edit, start/stop, and delete managed **NAT** or **Isolated** (host-only) networks from the new Networks screen (`n`), with configurable subnets and built-in DHCP — ideal for multi-VM labs. Host changes run only via inspectable generated `net-up.sh`/`net-down.sh` scripts with explicit sudo; managed networks appear in the per-VM bridge picker, and launching against a stopped network gives a clear error
@@ -294,6 +300,7 @@ Management menu options:
 - Change Display
 - 3D Acceleration toggle
 - Edit Notes
+- Resize Storage (grow the virtual disk)
 - Rename VM
 - Stop VM
 - Reset VM (recreate disk)
