@@ -129,3 +129,16 @@ fn test_free_iso_profiles() {
     let has_debian = free_profiles.iter().any(|(id, _)| *id == "linux-debian");
     assert!(has_debian, "Debian should have a free ISO URL");
 }
+
+#[test]
+fn test_haiku_profile_uses_ahci_disk_not_virtio() {
+    // #93: Haiku beta 6's installer/DriveSetup show no disk when the system
+    // disk is virtio-blk; the same VM installs fine over AHCI (if=ide on q35).
+    let store = QemuProfileStore::load_embedded();
+    let haiku = store.get("haiku").expect("haiku profile exists");
+    assert_eq!(haiku.machine.as_deref(), Some("q35"));
+    assert_eq!(
+        haiku.disk_interface, "ide",
+        "Haiku must not use a virtio disk (installer can't see it, #93)"
+    );
+}

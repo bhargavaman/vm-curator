@@ -1700,7 +1700,9 @@ machine = "q35"
 vga = "virtio"
 audio = ["intel-hda", "hda-duplex"]
 network_model = "virtio"
-disk_interface = "virtio"
+# AHCI (ide on q35), not virtio: Haiku beta 6's installer and DriveSetup don't
+# enumerate a virtio-blk disk, so the install had nothing to install onto (#93).
+disk_interface = "ide"
 disk_size_gb = 16
 enable_kvm = true
 uefi = false
@@ -1710,6 +1712,7 @@ usb_tablet = true
 display = "gtk"
 extra_args = []
 iso_url = "https://www.haiku-os.org/get-haiku/"
+notes = "Disk is attached via AHCI/SATA; Haiku's installer does not see virtio-blk disks (#93)."
 
 # =============================================================================
 # NeXT (m68k/i386)
