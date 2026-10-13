@@ -57,7 +57,10 @@ vm-curator is a feature-rich TUI application for managing QEMU/KVM virtual machi
 It provides automatic VM discovery, a 5-step creation wizard with 121 pre-configured
 OS profiles, snapshot management, USB passthrough, and 3D graphics acceleration."""
 depends = "$auto, qemu-system-x86, qemu-utils, bash"
-recommends = "ovmf, polkit, kmod"
+# qemu-system-gui holds the GTK/SPICE display and audio backends; Debian only
+# Recommends it from qemu-system-x86, so name it here too (#98).
+recommends = "qemu-system-gui, ovmf, swtpm, passt, polkit, kmod"
+suggests = "virt-viewer, dnsmasq, samba, qemu-system-arm, qemu-system-ppc, qemu-system-m68k"
 section = "utils"
 priority = "optional"
 assets = [
@@ -73,8 +76,26 @@ assets = [
     { source = "LICENSE", dest = "/usr/share/doc/vm-curator/LICENSE", mode = "644" },
 ]
 
+# Fedora splits QEMU: qemu-system-x86-core is the bare emulator with no UI,
+# audio or device modules; qemu-system-x86 pulls them all in (#98).
 [package.metadata.generate-rpm.requires]
-qemu-system-x86-core = "*"
+qemu-system-x86 = "*"
 qemu-img = "*"
 bash = "*"
 systemd-libs = "*"
+
+[package.metadata.generate-rpm.recommends]
+edk2-ovmf = "*"
+swtpm = "*"
+passt = "*"
+virt-viewer = "*"
+polkit = "*"
+kmod = "*"
+
+[package.metadata.generate-rpm.suggests]
+dnsmasq = "*"
+samba = "*"
+qemu-system-aarch64 = "*"
+qemu-system-arm = "*"
+qemu-system-ppc = "*"
+qemu-system-m68k = "*"

@@ -15,6 +15,7 @@ A fast and friendly Rust TUI for managing desktop QEMU/KVM virtual machines — 
 - **Fix Single-GPU Start Script Not Killing niri/Hyprland**: Both compositors are now matched (`Hyprland` is capitalised), so the GPU driver can actually unload on those desktops
 - **Per-VM Launch Log**: Every launch writes `<vm>/qemu.log` (timestamp, exact command, and everything QEMU prints for the life of the VM; previous run kept as `qemu.log.old`), and launch failures now point at it
 - **Fix Generated Scripts Not Executable on NixOS**: All generated scripts use `#!/usr/bin/env bash`, so running `./launch.sh` by hand and the sudo-executed network and single-GPU scripts work where `/bin/bash` doesn't exist
+- **Fix RPM Installing a Headless QEMU** (thanks @Revali25, #98): The RPM now depends on `qemu-system-x86` (not `-core`) so Fedora gets the display and audio modules; both packages declare the optional tools as weak dependencies, and the Change Display screen names the package to install when QEMU has no windowed backend
 
 **v1.4.0**
 - **Physical Disk Passthrough as Boot Device** (#80): Pass whole NVMe/SATA/USB disks straight through to guests — a new **Physical Disk** mode in the creation wizard (with a safety-filtered picker that excludes the host system disk, mounted disks, and LVM/swap members) and a **Passthrough Disks** management screen for existing VMs, with per-disk boot index; USB passthrough gains a boot-index option too. Also fixes a latent bug where Fedora's qcow2 OVMF firmware could be mistaken for the VM's disk — letting Reset VM delete it
@@ -441,7 +442,11 @@ facts = ["Fact 1", "Fact 2"]
 
 ### Dependencies
 
-- **Runtime**: QEMU, qemu-img, libudev
+- **Runtime**: QEMU with a windowed display backend, qemu-img, libudev. Distro packages split QEMU, so make sure you have the full one:
+  - Fedora/RHEL: `sudo dnf install qemu-system-x86 qemu-img edk2-ovmf swtpm` — `qemu-system-x86` (not `-core`) is what pulls in the GTK/SDL/SPICE display and audio modules; the RPM package depends on it
+  - Debian/Ubuntu: `sudo apt install qemu-system-x86 qemu-system-gui qemu-utils ovmf swtpm` — `qemu-system-gui` holds the display and audio backends and is only *recommended* by `qemu-system-x86`
+  - Arch: `sudo pacman -S qemu-desktop edk2-ovmf swtpm`
+  - If the Change Display screen offers only `vnc`/`none`, that's the sign QEMU was installed without its GUI modules
 - **Build**: a recent Rust stable toolchain (see `rust-toolchain.toml`), libudev-dev (Debian/Ubuntu) or systemd-libs (Arch)
 - **Optional**: OVMF/edk2 (UEFI), swtpm (Windows 11 TPM), virt-viewer (SPICE-app), passt (networking), dnsmasq + nftables/iptables (managed virtual networks), Looking Glass client (multi-GPU), polkit (bridge networking)
 
