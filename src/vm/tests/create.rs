@@ -1718,3 +1718,27 @@ fn test_create_vm_physical_disk_requires_selection() -> Result<()> {
     assert!(!library.path().join("physical-missing").exists());
     Ok(())
 }
+
+#[test]
+fn test_generate_launch_script_sets_window_name_from_vm_dir() {
+    // #96: every QEMU invocation carries `-name "$VM_NAME"`, and VM_NAME is
+    // derived from the script's directory so it follows a moved/renamed VM.
+    let config = WizardQemuConfig::default();
+    let script = generate_launch_script_with_os(
+        "Tiny11Pro",
+        "disk.qcow2",
+        Some(std::path::Path::new("/isos/tiny11.iso")),
+        false,
+        &config,
+        None,
+        None,
+    );
+    assert!(script.contains("VM_NAME=\"$(basename \"$VM_DIR\")\"\n"));
+    let invocations = script
+        .lines()
+        .filter(|l| l.trim_start().starts_with("qemu-system-"))
+        .count();
+    let names = script.matches("-name \"$VM_NAME\"").count();
+    assert!(invocations >= 3, "expected several boot-mode invocations");
+    assert_eq!(names, invocations, "one -name per invocation");
+}

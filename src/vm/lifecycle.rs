@@ -366,6 +366,9 @@ pub fn launch_vm_with_error_check(vm: &DiscoveredVm, options: &LaunchOptions) ->
     if let Err(e) = ensure_qmp_in_script(&vm.path) {
         log::warn!("launch_vm_with_error_check: could not patch QMP into launch.sh: {e}");
     }
+    if let Err(e) = ensure_name_in_script(&vm.path) {
+        log::warn!("launch_vm_with_error_check: could not patch -name into launch.sh: {e}");
+    }
     if let Err(e) = ensure_ovmf_vars_writable(&vm.path) {
         log::warn!("launch_vm_with_error_check: could not make OVMF_VARS writable: {e}");
     }
@@ -513,6 +516,9 @@ pub fn launch_vm_dbus(vm: &DiscoveredVm) -> Result<u32> {
 
     if let Err(e) = ensure_qmp_in_script(&vm.path) {
         log::warn!("launch_vm_dbus: could not patch QMP into launch.sh: {e}");
+    }
+    if let Err(e) = ensure_name_in_script(&vm.path) {
+        log::warn!("launch_vm_dbus: could not patch -name into launch.sh: {e}");
     }
     if let Err(e) = ensure_ovmf_vars_writable(&vm.path) {
         log::warn!("launch_vm_dbus: could not make OVMF_VARS writable: {e}");
@@ -2149,6 +2155,69 @@ pub fn ensure_qmp_in_script(vm_path: &Path) -> Result<()> {
 
     std::fs::write(&script_path, result).context("Failed to write patched launch.sh")?;
     Ok(())
+}
+
+/// Give every QEMU invocation in an existing launch.sh a `-name "$VM_NAME"`
+/// so the window is titled `QEMU (<vm-dir>)` (#96). Scripts generated after
+/// this change already have it; this repairs older ones at launch.
+///
+/// Idempotent and conservative: a script that already passes `-name`
+/// (ours or the user's own) is left alone, as is a hand-written script
+/// without the `VM_DIR=` line we hang the `VM_NAME` definition on.
+pub fn ensure_name_in_script(vm_path: &Path) -> Result<()> {
+    let script_path = vm_path.join("launch.sh");
+    let content = std::fs::read_to_string(&script_path)
+        .context("Failed to read launch.sh for -name patch")?;
+    if let Some(patched) = add_vm_name_to_script(&content) {
+        std::fs::write(&script_path, patched).context("Failed to write patched launch.sh")?;
+    }
+    Ok(())
+}
+
+/// Pure half of [`ensure_name_in_script`]: `None` when nothing needs changing.
+pub fn add_vm_name_to_script(content: &str) -> Option<String> {
+    let has_name = content.lines().any(|l| {
+        let t = l.trim_start();
+        !t.starts_with('#') && (t.starts_with("-name ") || t.contains(" -name "))
+    });
+    if has_name {
+        return None;
+    }
+    let vm_dir_line = content
+        .lines()
+        .position(|l| l.trim_start().starts_with("VM_DIR="))?;
+
+    let lines: Vec<&str> = content.lines().collect();
+    let mut out = String::with_capacity(content.len() + 128);
+    let mut changed = false;
+
+    for (i, line) in lines.iter().enumerate() {
+        out.push_str(line);
+        out.push('\n');
+
+        if i == vm_dir_line {
+            out.push_str("VM_NAME=\"$(basename \"$VM_DIR\")\"\n");
+            continue;
+        }
+
+        // First line of a multi-line QEMU invocation: `qemu-system-* \`
+        let t = line.trim();
+        let is_qemu_start = !t.starts_with('#')
+            && (t.starts_with("qemu-system-") || t.starts_with("exec qemu-system-"))
+            && t.ends_with('\\');
+        if is_qemu_start {
+            let indent: String = line.chars().take_while(|c| c.is_whitespace()).collect();
+            out.push_str(&indent);
+            out.push_str("-name \"$VM_NAME\" \\\n");
+            changed = true;
+        }
+    }
+
+    if changed {
+        Some(out)
+    } else {
+        None
+    }
 }
 
 /// Send a raw QMP command to a running VM's monitor socket.

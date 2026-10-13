@@ -993,6 +993,8 @@ pub fn generate_launch_script_with_os<'a>(
 
     // Variables
     script.push_str("VM_DIR=\"$(dirname \"$(readlink -f \"$0\")\")\"\n");
+    // Window title source for `-name` (#96): the VM directory name.
+    script.push_str("VM_NAME=\"$(basename \"$VM_DIR\")\"\n");
     match disk {
         DiskTarget::VmFile(disk_filename) => {
             script.push_str(&format!("DISK=\"$VM_DIR/{}\"\n", disk_filename));
@@ -1311,6 +1313,11 @@ fn build_qemu_command_with_os_impl<'a>(
 
     // Emulator
     args.push(config.emulator.clone());
+
+    // Window/process title: `QEMU (<vm-dir>)`, so window managers can match
+    // and place each VM's window (#96). `VM_NAME` is defined by the script
+    // from its own directory, so the title follows a moved/renamed VM dir.
+    args.push("-name \"$VM_NAME\"".to_string());
 
     // KVM acceleration
     if config.enable_kvm {
