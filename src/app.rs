@@ -24,7 +24,8 @@ use crate::metadata::{
 };
 use crate::ui::widgets::build_visual_order;
 use crate::vm::{
-    discover_vms, BootMode, DiscoveredVm, LaunchOptions, QemuProcess, SharedFolder, Snapshot,
+    discover_vms, BootMode, DiscoveredVm, LaunchOptions, QemuProcess, ShareMode, SharedFolder,
+    Snapshot,
 };
 pub use crate::wizard_types::*;
 
@@ -834,16 +835,10 @@ impl App {
 
     /// True if the shared-folder list changed since it was last entered or saved.
     pub fn shared_folders_dirty(&self) -> bool {
-        let current: std::collections::BTreeSet<(&str, &str)> = self
-            .shared_folders
-            .iter()
-            .map(|f| (f.host_path.as_str(), f.mount_tag.as_str()))
-            .collect();
-        let baseline: std::collections::BTreeSet<(&str, &str)> = self
-            .shared_folders_baseline
-            .iter()
-            .map(|f| (f.host_path.as_str(), f.mount_tag.as_str()))
-            .collect();
+        let key = |f: &SharedFolder| (f.host_path.clone(), f.mount_tag.clone(), f.mode);
+        let current: std::collections::BTreeSet<_> = self.shared_folders.iter().map(key).collect();
+        let baseline: std::collections::BTreeSet<_> =
+            self.shared_folders_baseline.iter().map(key).collect();
         current != baseline
     }
 
@@ -877,14 +872,18 @@ impl App {
         }
     }
 
-    /// Add a shared folder, generating a unique mount tag
+    /// Add a shared folder, generating a unique mount tag.
+    ///
+    /// Windows guests have no 9p driver but speak SMB natively, so on a
+    /// Windows-profile VM the first folder defaults to SMB mode when the VM
+    /// can support it (user-mode networking, no SMB folder yet) (#101).
     pub fn add_shared_folder(&mut self, host_path: String) {
         // Reject duplicate paths
         if self.shared_folders.iter().any(|f| f.host_path == host_path) {
             return;
         }
 
-        let mut mount_tag = generate_mount_tag(&host_path);
+        let mut mount_tag = crate::vm::generate_mount_tag(&host_path);
 
         // Ensure unique mount tag
         let base_tag = mount_tag.clone();
@@ -894,10 +893,65 @@ impl App {
             suffix += 1;
         }
 
+        let prefers_smb = crate::ui::screens::shared_folders::get_mount_tier(self) == "windows";
+        let mode = if prefers_smb && self.smb_share_available().is_ok() {
+            ShareMode::Smb
+        } else {
+            ShareMode::NineP
+        };
+
         self.shared_folders.push(SharedFolder {
             host_path,
             mount_tag,
+            mode,
         });
+    }
+
+    /// Whether the selected VM can take an(other) SMB-mode shared folder:
+    /// needs the `user` network backend and no SMB folder already configured.
+    pub fn smb_share_available(&self) -> Result<(), String> {
+        let Some(vm) = self.selected_vm() else {
+            return Err("No VM selected".to_string());
+        };
+        let backend_is_user = vm
+            .config
+            .network
+            .as_ref()
+            .map(|n| n.backend == crate::vm::qemu_config::NetworkBackend::User)
+            .unwrap_or(false);
+        if !backend_is_user {
+            return Err(
+                "SMB shares need user-mode networking; switch the backend to `user` in Network Settings"
+                    .to_string(),
+            );
+        }
+        if self.shared_folders.iter().any(|f| f.mode == ShareMode::Smb) {
+            return Err(
+                "Only one folder can use SMB mode (QEMU exports a single directory); share a parent folder instead"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Toggle the selected shared folder between 9p and SMB mode.
+    /// Returns an explanation when the switch to SMB isn't possible.
+    pub fn toggle_shared_folder_mode(&mut self) -> Result<ShareMode, String> {
+        let idx = self.shared_folder_selected;
+        let current = self
+            .shared_folders
+            .get(idx)
+            .map(|f| f.mode)
+            .ok_or_else(|| "No shared folder selected".to_string())?;
+        let next = match current {
+            ShareMode::NineP => {
+                self.smb_share_available()?;
+                ShareMode::Smb
+            }
+            ShareMode::Smb => ShareMode::NineP,
+        };
+        self.shared_folders[idx].mode = next;
+        Ok(next)
     }
 
     /// Remove the currently selected shared folder
@@ -1542,32 +1596,6 @@ fn pci_addr_from_arg(arg: &str) -> Option<String> {
     } else {
         Some(addr.to_string())
     }
-}
-
-/// Generate a mount tag from a host directory path
-fn generate_mount_tag(path: &str) -> String {
-    let folder_name = std::path::Path::new(path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("shared");
-    let sanitized: String = folder_name
-        .to_lowercase()
-        .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { '_' })
-        .collect();
-    let tag = sanitized
-        .split('_')
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("_");
-    format!(
-        "host_{}",
-        if tag.is_empty() {
-            "shared".to_string()
-        } else {
-            tag
-        }
-    )
 }
 
 #[cfg(test)]

@@ -35,6 +35,11 @@ impl SharedFoldersHelpStore {
         store
     }
 
+    /// Whether an entry exists for `key` (no fallback).
+    pub fn has(&self, key: &str) -> bool {
+        self.entries.contains_key(key)
+    }
+
     /// Load user overrides from a file
     pub fn load_user_overrides(&mut self, path: &Path) {
         if !path.exists() {
