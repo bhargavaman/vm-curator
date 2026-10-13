@@ -612,20 +612,36 @@ fi
 
 echo "Stopping processes using the GPU..."
 
-# Kill well-known compositors first...
-# (pkill matches the process name case-sensitively: it is `Hyprland`, not `hyprland`.)
+# The display manager is stopped, but its X/Wayland server can outlive the
+# unit by a few seconds (SDDM's Xorg still holds /dev/nvidia* after
+# `systemctl stop sddm` reports done, issue #92). Give it a moment to exit
+# on its own before killing — a clean exit releases the GPU faster than
+# SIGKILL followed by the kernel tearing down its fds.
+# (pgrep/pkill match the process name case-sensitively: it is `Hyprland`.)
+display_procs='Xorg|Xwayland|gnome-shell|kwin_wayland|plasmashell|sway|Hyprland|niri'
+for _ in $(seq 1 10); do
+    if ! pgrep -x "$display_procs" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+
+# Kill well-known compositors still around...
 for proc in Xorg Xwayland gnome-shell kwin_wayland plasmashell sway Hyprland niri; do
-    pkill -9 "$proc" 2>/dev/null || true
+    pkill -9 -x "$proc" 2>/dev/null || true
 done
 sleep 2
 
-# ...then sweep anything still holding a DRM or KFD node — greeter workers,
-# pipewire/wireplumber, lingering Xwayland, ROCm/compute users. Any open
-# /dev/dri or /dev/kfd fd keeps the GPU driver's refcount up and makes the
-# module unload below fail (issues #64, #75). Escalate gently: wait, then
-# SIGTERM, then SIGKILL.
+# ...then sweep anything still holding a GPU device node — greeter workers,
+# pipewire/wireplumber, lingering Xwayland, ROCm/compute users, CUDA apps.
+# Any open fd on /dev/dri, /dev/kfd or /dev/nvidia* keeps the GPU driver's
+# refcount up and makes the module unload below fail (issues #64, #75, #92).
+# Escalate gently: wait, then SIGTERM, then SIGKILL.
 gpu_nodes=(/dev/dri/*)
 [[ -e /dev/kfd ]] && gpu_nodes+=(/dev/kfd)
+for node in /dev/nvidia[0-9]* /dev/nvidiactl /dev/nvidia-modeset /dev/nvidia-uvm; do
+    [[ -c "$node" ]] && gpu_nodes+=("$node")
+done
 if command -v fuser >/dev/null 2>&1; then
     for attempt in $(seq 1 8); do
         if ! fuser -s "${{gpu_nodes[@]}}" 2>/dev/null; then
@@ -727,11 +743,11 @@ if [[ -e "/sys/bus/pci/devices/$GPU_ADDR/driver" ]]; then
         lsmod | grep -E "^($ORIGINAL_DRIVER|drm|snd_hda_intel) " || true
         # Scan /proc directly rather than trusting fuser alone: it misses
         # processes in other mount namespaces (flatpak, containers) (#75).
-        echo "Processes with DRM/KFD file descriptors (all namespaces):"
+        echo "Processes with GPU device file descriptors (all namespaces):"
         for fdlink in /proc/[0-9]*/fd/*; do
             tgt=$(readlink "$fdlink" 2>/dev/null) || continue
             case "$tgt" in
-                /dev/dri/*|/dev/kfd)
+                /dev/dri/*|/dev/kfd|/dev/nvidia*)
                     pid="${{fdlink#/proc/}}"; pid="${{pid%%/*}}"
                     echo "  pid $pid ($(cat /proc/$pid/comm 2>/dev/null)): $tgt"
                     ;;
@@ -2616,5 +2632,85 @@ echo after
         let vars = generate_variable_definitions(&vm, &components);
         assert!(!vars.contains("qemu-system-x86_64"));
         assert!(!vars.contains("echo after"));
+    }
+
+    fn nvidia_sddm_config() -> SingleGpuConfig {
+        use crate::hardware::{DisplayManager, GpuDriver, PciDevice};
+        let gpu = PciDevice {
+            address: "0000:01:00.0".to_string(),
+            vendor_id: 0x10de,
+            device_id: 0x2504,
+            vendor_name: "NVIDIA".to_string(),
+            device_name: "GeForce RTX 3060".to_string(),
+            class_code: 0x030000,
+            driver: Some("nvidia".to_string()),
+            iommu_group: Some(12),
+            is_boot_vga: true,
+            subsystem_vendor_id: 0,
+            subsystem_device_id: 0,
+        };
+        SingleGpuConfig {
+            gpu,
+            audio: None,
+            iommu_group_devices: Vec::new(),
+            original_driver: GpuDriver::Nvidia,
+            display_manager: DisplayManager::Sddm,
+            gpu_rom: None,
+            hide_kvm: true,
+        }
+    }
+
+    /// Issue #92: SDDM's Xorg outlives `systemctl stop sddm` and keeps
+    /// /dev/nvidia* open, so the module unload failed. The script must
+    /// (1) wait for the display server to exit before killing it and
+    /// (2) include the NVIDIA device nodes in the holder sweep, all before
+    /// the module unload.
+    #[test]
+    fn start_script_waits_for_display_server_and_sweeps_nvidia_nodes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vm = test_vm(tmp.path());
+        let script = generate_start_script(&vm, &nvidia_sddm_config()).unwrap();
+
+        let stop = script
+            .find("systemctl stop \"$DISPLAY_MANAGER\"")
+            .expect("display manager stop missing");
+        let wait = script
+            .find("pgrep -x \"$display_procs\"")
+            .expect("display-server wait loop missing");
+        let kill = script
+            .find("pkill -9 -x \"$proc\"")
+            .expect("compositor kill missing");
+        let sweep = script
+            .find("/dev/nvidia[0-9]* /dev/nvidiactl /dev/nvidia-modeset /dev/nvidia-uvm")
+            .expect("nvidia nodes missing from holder sweep");
+        let unload = script
+            .find("modprobe -r nvidia_drm")
+            .expect("nvidia unload missing");
+        assert!(stop < wait, "wait loop must follow the DM stop");
+        assert!(wait < kill, "kill must come after the wait");
+        assert!(kill < sweep, "holder sweep must follow the kill");
+        assert!(sweep < unload, "sweep must precede the module unload");
+        // Diagnostics name NVIDIA holders too.
+        assert!(script.contains("/dev/dri/*|/dev/kfd|/dev/nvidia*)"));
+    }
+
+    /// The NVIDIA start script must pass bash's own syntax check, like the
+    /// AMD one already does.
+    #[test]
+    fn nvidia_start_script_is_valid_bash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vm = test_vm(tmp.path());
+        let script = generate_start_script(&vm, &nvidia_sddm_config()).unwrap();
+        let path = tmp.path().join("start.sh");
+        std::fs::write(&path, &script).unwrap();
+        let out = std::process::Command::new("bash")
+            .args(["-n", path.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }
