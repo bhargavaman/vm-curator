@@ -1,0 +1,67 @@
+name: Publish crate
+
+# Publishes the crate to crates.io. Runs automatically at the end of the
+# Release workflow (via workflow_call), and can be run by hand for an existing
+# tag whose crates.io publish was skipped or failed:
+#
+#   gh workflow run publish-crate.yml -f tag=v1.5.0
+#
+# Requires the CARGO_REGISTRY_TOKEN repo secret: a crates.io API token with
+# the publish-update scope for vm-curator. Skips cleanly if unset, and is a
+# no-op if the version is already on crates.io, so re-runs are safe.
+
+on:
+  workflow_call:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish (e.g. v1.5.0)'
+        required: true
+        type: string
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify Cargo.toml version matches tag
+        env:
+          TAG_NAME: ${{ inputs.tag || github.ref_name }}
+        run: |
+          VERSION="${TAG_NAME#v}"
+          CRATE_VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "vm-curator") | .version')"
+          if [ "$CRATE_VERSION" != "$VERSION" ]; then
+            echo "Cargo.toml version ($CRATE_VERSION) does not match tag ($TAG_NAME)"
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "CARGO_REGISTRY_TOKEN not set; skipping crates.io publish"
+            exit 0
+          fi
+          if curl -fsS -o /dev/null -A "vm-curator-ci (https://github.com/${GITHUB_REPOSITORY})" \
+               "https://crates.io/api/v1/crates/vm-curator/${VERSION}"; then
+            echo "vm-curator ${VERSION} is already on crates.io; nothing to do"
+            exit 0
+          fi
+          cargo publish --locked
