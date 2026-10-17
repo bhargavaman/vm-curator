@@ -167,6 +167,13 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  # Publish the crate to crates.io. See publish-crate.yml for the required
+  # CARGO_REGISTRY_TOKEN secret and how to re-run it by hand for a tag.
+  publish-crate:
+    needs: [release]
+    uses: ./.github/workflows/publish-crate.yml
+    secrets: inherit
+
   # Bump the Homebrew tap (mroboff/homebrew-tap) to the new release.
   # Requires the HOMEBREW_TAP_TOKEN repo secret: a fine-grained PAT with
   # contents read/write on mroboff/homebrew-tap. Skips cleanly if unset.
